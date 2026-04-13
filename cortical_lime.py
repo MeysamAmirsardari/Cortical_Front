@@ -709,6 +709,21 @@ class CorticalIntegratedGradients:
         self.sr = np.asarray(aud_params["sr"], dtype=np.float32)
         self.n_strfs = self.sr.shape[0]
 
+        # Build a non-vmapped base model for conv calls (see make_jax_callables
+        # docstring for why the vmapped model's conv cannot be called directly).
+        from supervisedSTRF import supervisedSTRF
+        base_model = supervisedSTRF(
+            n_phones=model.n_phones,
+            input_type=model.input_type,
+            update_lin=model.update_lin,
+            use_class=model.use_class,
+            encoder_type=model.encoder_type,
+            decoder_type=model.decoder_type,
+            compression_method=model.compression_method,
+            conv_feats=model.conv_feats,
+            pooling_stride=model.pooling_stride,
+        )
+
         # Build the JIT-compiled gradient function.
         # We parameterise the channel mask as a continuous vector α,
         # compute logits(cortical * α), and take ∂logits/∂α.
@@ -716,18 +731,23 @@ class CorticalIntegratedGradients:
         def _encode(x):
             return model.apply(nn_params, x, aud_params, method=model.encode)
 
+        def _conv_single(x_single):
+            return base_model.apply(nn_params, x_single, method=base_model.conv)
+
         def _class_score(alpha_vec, cortical_single, target_cls):
             """Scalar: mean-over-time softmax probability of target_cls."""
             masked = cortical_single * alpha_vec[None, None, :]  # (F, T, S)
-            logits = model.apply(nn_params, masked[None, :, :, :], method=model.conv)
-            if logits.ndim == 4:
-                logits = logits.mean(axis=2)
-            # logits: (1, T, C).  Softmax + mean over time.
-            logits = logits[0]
-            probs = jax.nn.softmax(logits, axis=-1).mean(axis=0)
+            logits = _conv_single(masked)
+            if logits.ndim == 3:
+                logits = logits.mean(axis=1)
+            # logits: (T, C) or (C,).  Softmax + mean over time.
+            probs = jax.nn.softmax(logits, axis=-1)
+            if probs.ndim == 2:
+                probs = probs.mean(axis=0)
             return probs[target_cls]
 
         self._encode = _encode
+        self._conv_batch = jax.jit(jax.vmap(_conv_single))
         self._grad_fn = jax.jit(jax.grad(_class_score, argnums=0))
 
     def explain(self, waveform: np.ndarray, target_class: Optional[int] = None) -> dict:
@@ -736,9 +756,7 @@ class CorticalIntegratedGradients:
         cortical0 = cortical[0]
 
         if target_class is None:
-            logits = self.model.apply(
-                self.nn_params, cortical, method=self.model.conv,
-            )
+            logits = self._conv_batch(cortical)
             if logits.ndim == 4:
                 logits = logits.mean(axis=2)
             probs = jax.nn.softmax(logits[0], axis=-1).mean(axis=0)
@@ -771,14 +789,47 @@ def make_jax_callables(model, nn_params, aud_params):
     The resulting functions are JIT-compiled and gradient-free — the JAX
     equivalent of PyTorch's `torch.no_grad()`.  They are safe to call from
     pure-NumPy LIME code.
+
+    Implementation note
+    -------------------
+    ``vSupervisedSTRF`` is produced by ``nn.vmap(..., in_axes=(0, None))``,
+    which expects **two** positional arguments for every vmapped method.
+    ``encode(self, x, params)`` has two args so it works natively, but
+    ``conv(self, x)`` has only one — calling it through the vmapped wrapper
+    raises ``ValueError: Tuple arity mismatch: 1 != 2``.
+
+    We work around this by importing the non-vmapped base class
+    ``supervisedSTRF`` and applying ``jax.vmap`` ourselves for the decoder.
+    Since ``variable_axes={'params': None}`` was used in the original vmap,
+    the parameter tree structure is identical between the base class and the
+    vmapped wrapper.
     """
+    from supervisedSTRF import supervisedSTRF
+
+    # Build a non-vmapped twin sharing the same hyper-parameters.
+    base_model = supervisedSTRF(
+        n_phones=model.n_phones,
+        input_type=model.input_type,
+        update_lin=model.update_lin,
+        use_class=model.use_class,
+        encoder_type=model.encoder_type,
+        decoder_type=model.decoder_type,
+        compression_method=model.compression_method,
+        conv_feats=model.conv_feats,
+        pooling_stride=model.pooling_stride,
+    )
+
     @jax.jit
     def _encode(x):
         return model.apply(nn_params, x, aud_params, method=model.encode)
 
     @jax.jit
     def _decode(feats):
-        return model.apply(nn_params, feats, method=model.conv)
+        # Manually vmap over the batch dimension because the vmapped model's
+        # in_axes=(0, None) arity does not match conv's single argument.
+        return jax.vmap(
+            lambda x: base_model.apply(nn_params, x, method=base_model.conv)
+        )(feats)
 
     def encode_fn(wav_np):
         return np.asarray(_encode(jnp.asarray(wav_np)))
