@@ -782,6 +782,52 @@ class CorticalIntegratedGradients:
 # 8.  JAX MODEL BINDING
 # ═══════════════════════════════════════════════════════════════════════════
 
+def detect_n_phones(nn_params) -> int:
+    """Auto-detect n_phones from checkpoint weights.
+
+    The CNN decoder's final Dense layer has kernel shape (in_features,
+    n_phones + 1).  We find it by scanning the parameter tree for Dense
+    kernels and picking the one whose output dimension is the class count.
+    """
+    from flax.traverse_util import flatten_dict
+    flat = flatten_dict(nn_params, sep="/")
+    # Look for the last Dense kernel (Dense_0/kernel in the conv sub-tree).
+    dense_shapes = {k: v.shape for k, v in flat.items()
+                    if "Dense" in k and "kernel" in k}
+    if not dense_shapes:
+        raise RuntimeError("Cannot detect n_phones: no Dense kernel in checkpoint.")
+    # The class-output Dense is the one with the largest output dim.
+    key, shape = max(dense_shapes.items(), key=lambda kv: kv[1][-1])
+    n_classes = int(shape[-1])   # = n_phones + 1 (includes blank)
+    return n_classes - 1
+
+
+def build_model(nn_params, aud_params):
+    """Convenience: build a vSupervisedSTRF with n_phones auto-detected.
+
+    Returns (model, n_phones).
+    """
+    from supervisedSTRF import vSupervisedSTRF
+
+    n_phones = detect_n_phones(nn_params)
+
+    # Detect update_lin: if 'alpha' key exists in aud_params, LIN was updated.
+    update_lin = "alpha" in aud_params
+
+    model = vSupervisedSTRF(
+        n_phones=n_phones,
+        input_type="audio",
+        update_lin=update_lin,
+        use_class=False,
+        encoder_type="strf",
+        decoder_type="cnn",
+        compression_method="power",
+        conv_feats=[10, 20, 40],
+        pooling_stride=2,
+    )
+    return model, n_phones
+
+
 def make_jax_callables(model, nn_params, aud_params):
     """Build numpy-in / numpy-out (encode_fn, decode_fn) for a trained
     vSupervisedSTRF.

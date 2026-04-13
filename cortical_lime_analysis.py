@@ -65,10 +65,9 @@ R_CODE = SCRIPT_DIR.parent / "r_code" if (SCRIPT_DIR.parent / "r_code").is_dir()
 sys.path.insert(0, str(R_CODE))
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from supervisedSTRF import vSupervisedSTRF
 from cortical_lime import (
     CorticalLIME, OcclusionSensitivity, CorticalIntegratedGradients,
-    make_jax_callables, bootstrap_importances,
+    make_jax_callables, bootstrap_importances, build_model,
 )
 from cortical_lime_metrics import (
     deletion_curve, insertion_curve, random_baseline_curves,
@@ -142,11 +141,7 @@ def load_model(model_dir: str):
         else (obj["nn_params"], obj["params"])
     )
 
-    model = vSupervisedSTRF(
-        n_phones=61, input_type="audio", update_lin=True, use_class=False,
-        encoder_type="strf", decoder_type="cnn", compression_method="power",
-        conv_feats=[10, 20, 40], pooling_stride=2,
-    )
+    model, n_phones = build_model(nn_params, aud_params)
     encode_fn, decode_fn = make_jax_callables(model, nn_params, aud_params)
 
     # Warm-up JIT.

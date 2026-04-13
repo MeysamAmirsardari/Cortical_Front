@@ -196,7 +196,7 @@ def run(cfg: AnalysisConfig):
     from supervisedSTRF import vSupervisedSTRF
     from cortical_lime import (
         CorticalLIME, OcclusionSensitivity, CorticalIntegratedGradients,
-        make_jax_callables, bootstrap_importances,
+        make_jax_callables, bootstrap_importances, build_model,
     )
     from cortical_lime_metrics import (
         deletion_curve, insertion_curve, random_baseline_curves,
@@ -263,15 +263,11 @@ def run(cfg: AnalysisConfig):
         else (obj["nn_params"], obj["params"])
     )
 
-    model = vSupervisedSTRF(
-        n_phones=cfg.n_phones, input_type="audio", update_lin=True,
-        use_class=False, encoder_type="strf", decoder_type="cnn",
-        compression_method="power", conv_feats=[10, 20, 40], pooling_stride=2,
-    )
+    model, n_phones = build_model(nn_params, aud_params)
     encode_fn, decode_fn = make_jax_callables(model, nn_params, aud_params)
     sr_pairs = np.asarray(aud_params["sr"])
     S = sr_pairs.shape[0]
-    log(f"  STRF bank: {S} channels")
+    log(f"  STRF bank: {S} channels  n_phones: {n_phones}")
 
     # JIT warm-up.
     _d = np.zeros((1, 16000), dtype=np.float32)
