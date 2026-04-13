@@ -24,6 +24,9 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 from scipy import stats
 
+# _trapz was removed in NumPy 2.0; use np.trapezoid when available.
+_trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # §1  DELETION / INSERTION CURVES
@@ -77,7 +80,7 @@ def deletion_curve(
         probs[i] = p
 
     fractions = indices / S
-    auc = float(np.trapz(probs, fractions))
+    auc = float(_trapz(probs, fractions))
     return DeletionInsertionResult(fractions, probs, auc, order)
 
 
@@ -109,7 +112,7 @@ def insertion_curve(
         probs[i] = _logits_to_single_prob(logits, target_class)
 
     fractions = indices / S
-    auc = float(np.trapz(probs, fractions))
+    auc = float(_trapz(probs, fractions))
     return DeletionInsertionResult(fractions, probs, auc, order)
 
 
