@@ -884,7 +884,7 @@ def main():
     # ── Build explainers ──────────────────────────────────────────────
     explainer = CorticalLIME(
         encode_fn=encode_fn, decode_fn=decode_fn, sr=sr_pairs,
-        strategy="bernoulli", n_samples=args.n_lime_samples, keep_prob=0.5,
+        strategy="bernoulli", n_samples=args.n_lime_samples, keep_prob=0.85,
         kernel_width=0.25, surrogate_type="ridge", surrogate_alpha=1.0,
         batch_size=args.batch_size, seed=args.seed,
     )
