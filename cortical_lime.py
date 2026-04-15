@@ -56,7 +56,11 @@ class PerturbStrategy(str, Enum):
     """Supported perturbation strategies for the interpretable domain.
 
     BERNOULLI   Binary on/off per channel, i.i.d. Bernoulli(keep_prob).
-                Maximises information per sample when keep_prob=0.5.
+                Default keep_prob=0.85 perturbs only ~15% of filters per
+                sample, preserving the acoustic manifold so the surrogate
+                regression retains high R². Masking ~50% of channels
+                destroys the manifold and collapses predictions toward
+                chance, ruining fidelity.
     GAUSSIAN    Continuous scaling: each channel is multiplied by a sample
                 from N(1, σ²), clipped to [0, ∞).  Richer signal per
                 perturbation at the cost of a non-binary interpretable
@@ -129,7 +133,7 @@ def generate_perturbation_masks(
     n_strfs: int,
     n_samples: int,
     strategy: PerturbStrategy | str = PerturbStrategy.BERNOULLI,
-    keep_prob: float = 0.5,
+    keep_prob: float = 0.85,
     sigma: float = 0.5,
     sr: Optional[np.ndarray] = None,
     n_groups: int = 8,
@@ -464,7 +468,7 @@ class CorticalLIME:
         *,
         strategy: PerturbStrategy | str = PerturbStrategy.BERNOULLI,
         n_samples: int = 2000,
-        keep_prob: float = 0.5,
+        keep_prob: float = 0.85,
         sigma: float = 0.5,
         n_groups: int = 8,
         distance_metric: DistanceMetric | str = DistanceMetric.COSINE,

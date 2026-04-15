@@ -78,7 +78,7 @@ class AnalysisConfig:
 
     # -- CorticalLIME --
     n_lime_samples: int = 2000               # perturbation masks per utterance
-    keep_prob: float = 0.5                    # Bernoulli keep probability
+    keep_prob: float = 0.85                   # Bernoulli keep probability (perturb ~15% of filters / sample)
     kernel_width: float = 0.25               # LIME exponential kernel σ
     surrogate_type: str = "ridge"            # ridge | lasso | bayesian_ridge
     surrogate_alpha: float = 1.0             # regularisation strength
