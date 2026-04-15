@@ -107,11 +107,24 @@ class AnalysisConfig:
     seed: int = 42
     skip_sections: list = None               # e.g. ["C", "L"]
 
+    # -- Plot-4 word trajectories --
+    trajectory_words: list = None            # target words for lingo fig 4
+    trajectory_duration: float = 1.0         # crop length for word-centred LIME
+
+    # -- Execution modes --
+    plots_only: bool = False                 # reuse saved npz, skip all analysis
+    skip_lime: bool = False                  # reuse saved LIME but still plot
+
     def __post_init__(self):
         if self.noise_levels is None:
             self.noise_levels = [1e-4, 1e-3, 5e-3, 1e-2, 5e-2]
         if self.skip_sections is None:
             self.skip_sections = []
+        if self.trajectory_words is None:
+            self.trajectory_words = [
+                "stop", "dark", "wash", "ask", "greasy",
+                "year", "oily", "water", "carry", "suit",
+            ]
 
 
 PROFILES = {
@@ -164,6 +177,121 @@ def check_dependencies():
 # ═══════════════════════════════════════════════════════════════════════════
 # 3.  Cochlear filter cache
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _collect_word_trajectories(
+    ds, encode_fn, explainer, sr_pairs, cfg, log,
+):
+    """Locate target words in TIMIT and build time-resolved cortical
+    trajectories for the lingo_analysis Plot-4 panels.
+
+    For each target word, the first utterance that contains it is chosen.
+    A duration-cfg-sized crop is extracted, centred on the word's midpoint,
+    RMS-normalised, passed through the biomimetic frontend to obtain the
+    cortical-feature tensor, and explained with CorticalLIME. The per-frame
+    saliency is then ``|LIME importance| × per-frame cortical energy``,
+    aggregated into three linguistically-motivated filter groups.
+    """
+    import numpy as np
+    from lingo_analysis import categorise_filters, FILTER_GROUPS
+
+    SR = 16_000
+    FRAME_SAMPLES = 80  # 5 ms at 16 kHz — matches TIMIT labels
+
+    target_set = [w.lower() for w in cfg.trajectory_words]
+    found = {}
+    for utt in ds:
+        for ws in utt.word_segments:
+            w = ws.word.lower()
+            if w in target_set and w not in found:
+                found[w] = (utt, ws)
+        if len(found) == len(target_set):
+            break
+
+    missing = [w for w in target_set if w not in found]
+    if missing:
+        log(f"  Missing target words (not found in split): {missing}")
+    if not found:
+        return []
+
+    groups = categorise_filters(sr_pairs)
+    filter_labels = [fl for fl, _ in FILTER_GROUPS]
+    group_keys = [gk for _, gk in FILTER_GROUPS]
+
+    n_target = int(cfg.trajectory_duration * SR)
+    n_target_frames = n_target // FRAME_SAMPLES
+
+    trajectories = []
+    ordered = [w for w in target_set if w in found]
+    for w in ordered:
+        utt, ws = found[w]
+        y = utt.audio
+        # Centre the crop on the midpoint of the word.
+        mid = (ws.start_sample + ws.end_sample) // 2
+        s = mid - n_target // 2
+        if s < 0:
+            s = 0
+        if s + n_target > len(y):
+            s = max(0, len(y) - n_target)
+        y_crop = y[s:s + n_target]
+        if len(y_crop) < n_target:
+            y_crop = np.pad(y_crop, (0, n_target - len(y_crop)))
+        rms = float(np.sqrt(np.mean(y_crop ** 2)))
+        if rms > 0:
+            y_crop = y_crop / rms
+        y_crop = y_crop.astype(np.float32)
+
+        # Word-specific LIME importance (reused per word; expensive but
+        # correct — ~10 calls total, which is a tiny overhead).
+        res = explainer.explain(y_crop)
+        imp = np.abs(np.asarray(res.importances, dtype=np.float64))
+
+        feats = np.asarray(encode_fn(y_crop[None, :])[0])  # (F, T, S)
+        # |feats| summed over the frequency axis → (T, S) per-channel energy.
+        energy = np.abs(feats).sum(axis=0)  # shape (T, S)
+        T = energy.shape[0]
+        saliency = imp[None, :] * energy   # (T, S)
+
+        traj = np.zeros((len(group_keys), T), dtype=np.float64)
+        for gi, gk in enumerate(group_keys):
+            idx = groups.get(gk, np.array([], dtype=int))
+            if idx.size:
+                traj[gi] = saliency[:, idx].sum(axis=1)
+
+        # Normalise whole panel so rows are comparable.
+        m = traj.max()
+        if m > 0:
+            traj = traj / m
+
+        # Phoneme boundaries *inside the crop*: find all phone segments
+        # whose [start, end] intersects the crop window, convert to local
+        # frame indices.
+        crop_start = s
+        crop_end = s + n_target
+        bounds: list = []
+        for ps in utt.phone_segments:
+            if ps.end_sample <= crop_start or ps.start_sample >= crop_end:
+                continue
+            local_start = max(ps.start_sample, crop_start) - crop_start
+            frame = int(local_start // FRAME_SAMPLES)
+            phn = ps.phone_39 if getattr(ps, "phone_39", "") else ps.phone
+            if phn and phn != "sil":
+                bounds.append((frame, f"/{phn}/"))
+        # De-duplicate consecutive identical phones and sort by frame.
+        bounds.sort(key=lambda x: x[0])
+        dedup: list = []
+        for b in bounds:
+            if not dedup or dedup[-1][1] != b[1]:
+                dedup.append(b)
+        bounds = dedup
+
+        trajectories.append(
+            {"word": w, "trajectory": traj, "boundaries": bounds,
+             "r2": float(res.surrogate_r2)}
+        )
+        log(f"  {w:10s}  frames={T}  bounds={len(bounds)}  R²={res.surrogate_r2:.3f}")
+
+    return trajectories
+
 
 def ensure_cochlear_npz():
     npz = R_CODE / "cochlear_filter_params.npz"
@@ -422,16 +550,41 @@ def run(cfg: AnalysisConfig):
     # ══════════════════════════════════════════════════════════════════
     # Run CorticalLIME on all utterances
     # ══════════════════════════════════════════════════════════════════
-    log(f"\nRunning CorticalLIME on {len(utts)} utterances...")
-    all_results = []
-    for i, utt in enumerate(utts):
-        wav = utt.segment_audio(1.0)
-        all_results.append(explainer.explain(wav))
-        if (i + 1) % 25 == 0:
-            mr2 = np.mean([r.surrogate_r2 for r in all_results])
-            log(f"  {i+1}/{len(utts)}  mean R²={mr2:.4f}")
-    mr2_final = np.mean([r.surrogate_r2 for r in all_results])
-    log(f"  Done. Mean R²={mr2_final:.4f}")
+    saved_npz = out / "results_raw.npz"
+    if cfg.skip_lime and saved_npz.is_file():
+        log(f"\n[--skip_lime] Reloading LIME results from {saved_npz}")
+
+        class _Stub:
+            pass
+
+        with np.load(saved_npz, allow_pickle=True) as d:
+            imps = np.asarray(d["importances"])
+            tcs = np.asarray(d["target_classes"])
+            tps = np.asarray(d["target_probs"])
+            r2s = np.asarray(d["surrogate_r2s"])
+        all_results = []
+        for i in range(len(imps)):
+            r = _Stub()
+            r.importances = imps[i]
+            r.target_class = int(tcs[i])
+            r.target_prob = float(tps[i])
+            r.surrogate_r2 = float(r2s[i])
+            # downstream sections that need masks/probs are safely skipped
+            # via --skip when --skip_lime is used.
+            all_results.append(r)
+        log(f"  Loaded {len(all_results)} cached LIME results "
+            f"(mean R²={r2s.mean():.4f})")
+    else:
+        log(f"\nRunning CorticalLIME on {len(utts)} utterances...")
+        all_results = []
+        for i, utt in enumerate(utts):
+            wav = utt.segment_audio(1.0)
+            all_results.append(explainer.explain(wav))
+            if (i + 1) % 25 == 0:
+                mr2 = np.mean([r.surrogate_r2 for r in all_results])
+                log(f"  {i+1}/{len(utts)}  mean R²={mr2:.4f}")
+        mr2_final = np.mean([r.surrogate_r2 for r in all_results])
+        log(f"  Done. Mean R²={mr2_final:.4f}")
 
     # ══════════════════════════════════════════════════════════════════
     # C.  Faithfulness
@@ -835,6 +988,39 @@ def run(cfg: AnalysisConfig):
         utterance_ids=np.array([u.utterance_id for u in utts]),
     )
 
+    # ══════════════════════════════════════════════════════════════════
+    # N.  Per-word cortical trajectories (for lingo_analysis Plot 4)
+    # ══════════════════════════════════════════════════════════════════
+    log("\n── N. Per-word cortical trajectories ──")
+    traj_out = _collect_word_trajectories(
+        ds, encode_fn, explainer, sr_pairs, cfg, log,
+    )
+    if traj_out:
+        np.savez(
+            out / "trajectories.npz",
+            trajectories=np.array(traj_out, dtype=object),
+        )
+        log(f"  Saved {len(traj_out)} word trajectories → trajectories.npz")
+    else:
+        log("  No target words located — skipping trajectory save.")
+
+    # ══════════════════════════════════════════════════════════════════
+    # O.  lingo_analysis publication figures
+    # ══════════════════════════════════════════════════════════════════
+    log("\n── O. lingo_analysis figures ──")
+    try:
+        from lingo_analysis import render_all as _render_lingo
+        lingo_out = out / "figures_lingo"
+        written = _render_lingo(
+            str(out / "results_raw.npz"),
+            str(out / "trajectories.npz") if traj_out else None,
+            str(lingo_out),
+        )
+        for k, v in written.items():
+            log(f"  {k}: {v}")
+    except Exception as e:
+        log(f"  lingo_analysis failed: {e}")
+
     elapsed = time.time() - t_start
     log(f"\n{'='*50}")
     log(f"Total time: {elapsed/60:.1f} min")
@@ -868,6 +1054,13 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--skip", type=str, nargs="*", default=None,
                         help="Sections to skip (e.g. --skip C L).")
+    parser.add_argument("--plots_only", action="store_true",
+                        help="Skip everything; reload saved results_raw.npz "
+                             "and trajectories.npz and re-render the "
+                             "lingo_analysis figures only.")
+    parser.add_argument("--skip_lime", action="store_true",
+                        help="Reuse a previously saved results_raw.npz "
+                             "instead of re-running CorticalLIME.")
     args = parser.parse_args()
 
     # Start from profile, then override with CLI args.
@@ -888,10 +1081,41 @@ def main():
         cfg.seed = args.seed
     if args.skip is not None:
         cfg.skip_sections = args.skip
+    cfg.plots_only = args.plots_only
+    cfg.skip_lime = args.skip_lime
+
+    if cfg.plots_only:
+        _plots_only(cfg)
+        return
 
     check_dependencies()
     ensure_cochlear_npz()
     run(cfg)
+
+
+def _plots_only(cfg: AnalysisConfig):
+    """Re-render lingo_analysis figures from a previously saved run.
+
+    Expects ``results_raw.npz`` (and optionally ``trajectories.npz``) to
+    already exist in ``cfg.output_dir``. Performs no LIME / no model / no
+    dataset loading — purely a figure refresh.
+    """
+    from pathlib import Path
+    out = Path(cfg.output_dir)
+    results = out / "results_raw.npz"
+    trajs = out / "trajectories.npz"
+    if not results.is_file():
+        print(f"[plots_only] missing {results}; run the full pipeline first.")
+        sys.exit(1)
+    from lingo_analysis import render_all as _render_lingo
+    written = _render_lingo(
+        str(results),
+        str(trajs) if trajs.is_file() else None,
+        str(out / "figures_lingo"),
+    )
+    print("[plots_only] wrote:")
+    for k, v in written.items():
+        print(f"  {k}: {v}")
 
 
 if __name__ == "__main__":
