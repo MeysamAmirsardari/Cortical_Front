@@ -1,26 +1,31 @@
-"""Publication-quality figures for CorticalLIME analyses.
+"""Mechanistic interpretability figures for the biomimetic auditory frontend.
 
-This module is fully self-contained: every plot has a matching dummy-data
-generator that produces structured, neuro-linguistically motivated data so the
-figures convey the intended message out of the box. Replace the dummy
-generators with real outputs from the CorticalLIME pipeline to produce the
-final camera-ready versions.
+Given a CorticalLIME run's raw output (``results_raw.npz``) and an optional
+per-word trajectory file (``trajectories.npz``), this module produces five
+publication-quality figures:
 
-Four figures are produced:
+    1.  ``plot_temporal_rate_marginal``     – Temporal-rate marginal importance
+                                              (the "rhythmic signature").
+    2.  ``plot_manner_heatmaps``            – Rate-×-scale importance heatmaps
+                                              grouped by manner of articulation.
+    3.  ``plot_phonetic_dendrogram``        – Unsupervised hierarchical taxonomy
+                                              of the TIMIT-39 inventory.
+    4a. ``plot_cortical_trajectory_panel``  – Dynamic cortical trajectories,
+    4b.                                      split across two figures of five
+                                              target words each.
 
-    1.  ``plot_temporal_rate_marginal``   – "The Rhythmic Signature"
-    2.  ``plot_manner_heatmaps``          – "Phonetic Universals"
-    3.  ``plot_phonetic_dendrogram``      – "The Aha! Moment"
-    4.  ``plot_cortical_trajectory``      – "Time-Series Shift"
+All figures use serif fonts, removed top/right spines, 400 DPI, and a
+colour-blind-friendly (ColorBrewer-inspired) palette, and are saved as PNG.
 
-All figures share the same academic aesthetic: serif fonts, top/right spines
-removed, high DPI (400), colour-blind-friendly (ColorBrewer) palettes, and PNG
-output.
+The pipeline is strictly data-driven — no dummy data is generated. Call
+``render_all`` or use the CLI::
 
-Usage
------
->>> python lingo_analysis.py                # writes PNGs to ./figures/
->>> python lingo_analysis.py --outdir out/  # custom output directory
+    python lingo_analysis.py --results results_raw.npz \
+                             --trajectories trajectories.npz \
+                             --outdir figures_lingo/
+
+``render_all`` is also imported by ``run.py`` and invoked automatically at the
+end of the full analysis pipeline.
 """
 
 from __future__ import annotations
@@ -28,20 +33,19 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-from matplotlib.colors import ListedColormap
-from scipy.cluster.hierarchy import dendrogram, linkage, set_link_color_palette
+from scipy.cluster.hierarchy import dendrogram, linkage
 
 # =============================================================================
 #                               GLOBAL AESTHETICS
 # =============================================================================
 
-# Colour-blind-friendly qualitative palette (ColorBrewer "Set2"/"Dark2" hybrids)
+# ColorBrewer-inspired, colour-blind-friendly qualitative palette.
 FAMILY_COLORS: Dict[str, str] = {
     "Vowels":     "#D7263D",   # red
     "Stops":      "#1B4F8B",   # blue
@@ -49,9 +53,57 @@ FAMILY_COLORS: Dict[str, str] = {
     "Nasals":     "#6A359C",   # purple
 }
 
-# Sequential colour-blind-friendly map for heatmaps
 SEQ_CMAP = "viridis"
-DIVERGING_CMAP = "RdBu_r"
+
+# TIMIT-39 phones grouped by manner of articulation (canonical order).
+PHONEMES_BY_FAMILY: Dict[str, List[str]] = {
+    "Vowels": [
+        "iy", "ih", "eh", "ae", "aa", "ah", "uw", "uh", "er",
+        "ey", "ay", "oy", "aw", "ow",
+    ],
+    "Stops":      ["b", "d", "g", "p", "t", "k"],
+    "Fricatives": ["s", "sh", "z", "f", "th", "v", "dh", "hh"],
+    "Nasals":     ["m", "n", "ng"],
+}
+
+# Flattened phone → family lookup.
+FAMILY_OF: Dict[str, str] = {
+    p: fam for fam, ps in PHONEMES_BY_FAMILY.items() for p in ps
+}
+
+# TIMIT 61 → 39 folding (Lee & Hon, 1989), restricted to phones used here.
+PHONE_61_TO_39: Dict[str, str] = {
+    "aa": "aa", "ae": "ae", "ah": "ah", "ao": "aa", "aw": "aw",
+    "ax": "ah", "ax-h": "ah", "axr": "er", "ay": "ay",
+    "b": "b", "bcl": "sil", "ch": "ch",
+    "d": "d", "dcl": "sil", "dh": "dh", "dx": "dx",
+    "eh": "eh", "el": "l", "em": "m", "en": "n", "eng": "ng",
+    "epi": "sil", "er": "er", "ey": "ey",
+    "f": "f", "g": "g", "gcl": "sil",
+    "h#": "sil", "hh": "hh", "hv": "hh",
+    "ih": "ih", "ix": "ih", "iy": "iy",
+    "jh": "jh", "k": "k", "kcl": "sil",
+    "l": "l", "m": "m", "n": "n", "ng": "ng", "nx": "n",
+    "ow": "ow", "oy": "oy", "p": "p", "pau": "sil", "pcl": "sil",
+    "q": "", "r": "r", "s": "s", "sh": "sh",
+    "t": "t", "tcl": "sil", "th": "th",
+    "uh": "uh", "uw": "uw", "ux": "uw",
+    "v": "v", "w": "w", "y": "y", "z": "z", "zh": "sh",
+}
+
+# Canonical 1-indexed TIMIT-61 inventory.
+_TIMIT_61 = [
+    "aa", "ae", "ah", "ao", "aw", "ax", "ax-h", "axr", "ay",
+    "b", "bcl", "ch", "d", "dcl", "dh", "dx",
+    "eh", "el", "em", "en", "eng", "epi", "er", "ey",
+    "f", "g", "gcl", "h#", "hh", "hv",
+    "ih", "ix", "iy",
+    "jh", "k", "kcl", "l", "m", "n", "ng", "nx",
+    "ow", "oy", "p", "pau", "pcl", "q", "r",
+    "s", "sh", "t", "tcl", "th", "uh", "uw", "ux",
+    "v", "w", "y", "z", "zh",
+]
+IDX_TO_PHONE61 = {i + 1: p for i, p in enumerate(_TIMIT_61)}
 
 
 def set_academic_style() -> None:
@@ -65,7 +117,6 @@ def set_academic_style() -> None:
             "axes.titlesize": 13,
             "axes.titleweight": "bold",
             "axes.labelsize": 11,
-            "axes.labelweight": "regular",
             "xtick.labelsize": 9,
             "ytick.labelsize": 9,
             "legend.fontsize": 9,
@@ -86,246 +137,156 @@ def set_academic_style() -> None:
 
 
 def _despine(ax: plt.Axes) -> None:
-    """Hard-remove the top/right spines on a given Axes object."""
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
 
 
 # =============================================================================
-#                              SHARED CONSTANTS
+#                         LOADING & AGGREGATION
 # =============================================================================
 
-# Biomimetic STRF axes (Chi, Ru & Shamma 2005 conventions).
-TEMPORAL_RATES_HZ = np.array(
-    [1.0, 1.4, 2.0, 2.8, 4.0, 5.7, 8.0, 11.3, 16.0, 22.6, 32.0], dtype=np.float64
-)
-SPECTRAL_SCALES_CPO = np.array(
-    [0.25, 0.5, 1.0, 2.0, 4.0, 8.0], dtype=np.float64
-)
+@dataclass
+class LimeResults:
+    """Container for the contents of ``results_raw.npz``."""
+    importances: np.ndarray   # (N, S)
+    target_classes: np.ndarray  # (N,) int, 1-indexed TIMIT-61
+    sr_pairs: np.ndarray      # (S, 2)  columns: [scale (cyc/oct), rate (Hz)]
 
-# Canonical TIMIT-39 inventory (Lee & Hon 1989), grouped by manner.
-PHONEMES_BY_FAMILY: Dict[str, List[str]] = {
-    "Vowels": [
-        "iy", "ih", "eh", "ae", "aa", "ah", "uw", "uh", "er", "ey", "ay",
-        "oy", "aw", "ow",
-    ],
-    "Stops":      ["b", "d", "g", "p", "t", "k"],
-    "Fricatives": ["s", "sh", "z", "f", "th", "v", "dh", "hh"],
-    "Nasals":     ["m", "n", "ng"],
-}
+    @property
+    def rates(self) -> np.ndarray:
+        return self.sr_pairs[:, 1]
+
+    @property
+    def scales(self) -> np.ndarray:
+        return self.sr_pairs[:, 0]
 
 
-# =============================================================================
-#                       DUMMY-DATA GENERATORS (HYPOTHESIS-DRIVEN)
-# =============================================================================
-
-def _gauss2d(
-    rates: np.ndarray,
-    scales: np.ndarray,
-    mu_rate: float,
-    mu_scale: float,
-    sigma_rate: float,
-    sigma_scale: float,
-    amp: float = 1.0,
-) -> np.ndarray:
-    """2-D Gaussian bump on a (scale, rate) grid, in log space."""
-    R, S = np.meshgrid(np.log2(rates), np.log2(scales))
-    Z = amp * np.exp(
-        -((R - np.log2(mu_rate)) ** 2) / (2 * sigma_rate ** 2)
-        - ((S - np.log2(mu_scale)) ** 2) / (2 * sigma_scale ** 2)
-    )
-    return Z
+def load_lime_results(path: str) -> LimeResults:
+    """Load ``results_raw.npz`` produced by ``run.py``."""
+    with np.load(path, allow_pickle=True) as d:
+        importances = np.asarray(d["importances"], dtype=np.float64)
+        target_classes = np.asarray(d["target_classes"], dtype=np.int64)
+        sr_pairs = np.asarray(d["sr_pairs"], dtype=np.float64)
+    return LimeResults(importances, target_classes, sr_pairs)
 
 
-def dummy_temporal_rate_importance(
-    rates: np.ndarray = TEMPORAL_RATES_HZ,
-    n_utterances: int = 240,
-    seed: int = 0,
-) -> np.ndarray:
-    """Dummy |importance| bootstrap sample per rate channel.
+def _phone61_idx_to_39(idx: int) -> str:
+    p61 = IDX_TO_PHONE61.get(int(idx), "")
+    return PHONE_61_TO_39.get(p61, "")
 
-    Encodes the hypothesis that English (stress-timed) peaks near ~4 Hz with a
-    broad shoulder across 2–8 Hz (syllabic rate), decaying toward both ends.
+
+def aggregate_per_phoneme(res: LimeResults) -> Dict[str, np.ndarray]:
+    """Mean absolute importance per TIMIT-39 phoneme.
 
     Returns
     -------
-    (n_utterances, len(rates)) float array.
+    dict mapping phone_39 → (S,) mean |importance| vector.
     """
-    rng = np.random.default_rng(seed)
-    log_r = np.log2(rates)
-    peak = np.log2(4.0)
-    # Skewed log-normal-ish envelope + second micro-peak at ~16 Hz (phonemic).
-    envelope = 1.0 * np.exp(-((log_r - peak) ** 2) / (2 * 0.9 ** 2)) \
-        + 0.28 * np.exp(-((log_r - np.log2(16.0)) ** 2) / (2 * 0.55 ** 2))
-    envelope = 0.05 + envelope  # baseline floor
-    # Multiplicative log-normal noise across utterances
-    noise = rng.lognormal(mean=0.0, sigma=0.18, size=(n_utterances, rates.size))
-    samples = envelope[None, :] * noise
-    return samples.astype(np.float64)
+    bucket: Dict[str, List[np.ndarray]] = {}
+    for imp, tc in zip(res.importances, res.target_classes):
+        p39 = _phone61_idx_to_39(tc)
+        if not p39 or p39 == "sil":
+            continue
+        bucket.setdefault(p39, []).append(np.abs(imp))
+    return {p: np.mean(np.stack(v, 0), 0) for p, v in bucket.items()}
 
 
-def dummy_manner_heatmaps(
-    rates: np.ndarray = TEMPORAL_RATES_HZ,
-    scales: np.ndarray = SPECTRAL_SCALES_CPO,
-    seed: int = 1,
-) -> Dict[str, np.ndarray]:
-    """Synthetic |importance| heatmap per manner class (scale × rate)."""
-    rng = np.random.default_rng(seed)
-
-    # Vowels ─ high scale (>2 cyc/oct), low rate (<8 Hz): slow harmonic stack.
-    vowels = _gauss2d(rates, scales, mu_rate=3.0, mu_scale=4.0,
-                      sigma_rate=0.6, sigma_scale=0.6, amp=1.0)
-    # Stops ─ low scale (<1 cyc/oct), high rate (>16 Hz): fast broadband burst.
-    stops = _gauss2d(rates, scales, mu_rate=20.0, mu_scale=0.5,
-                     sigma_rate=0.55, sigma_scale=0.55, amp=1.0)
-    # Fricatives ─ mid/high scale, mid/high rate: sustained noise w/ texture.
-    fricatives = _gauss2d(rates, scales, mu_rate=10.0, mu_scale=3.0,
-                          sigma_rate=0.7, sigma_scale=0.7, amp=1.0)
-
-    out = {
-        "Vowels": vowels,
-        "Stops": stops,
-        "Fricatives": fricatives,
-    }
-    for k, v in out.items():
-        v = v + 0.04 * rng.standard_normal(v.shape)
-        v = np.clip(v, 0.0, None)
-        out[k] = v / v.max()
-    return out
+def _unique_axis_values(values: np.ndarray) -> np.ndarray:
+    return np.array(sorted(set(np.round(values, 6).tolist())))
 
 
-def dummy_phonetic_weight_matrix(
-    n_filters: int = 66,  # 11 rates × 6 scales
-    seed: int = 2,
-) -> Tuple[np.ndarray, List[str], List[str]]:
-    """Dummy (39 × N_filters) CorticalLIME weight matrix for TIMIT-39.
-
-    Constructed so that hierarchical clustering naturally recovers the four
-    manner families — the "aha" moment of the paper.
-    """
-    rng = np.random.default_rng(seed)
-
-    rates = TEMPORAL_RATES_HZ
-    scales = SPECTRAL_SCALES_CPO
-
-    family_templates = {
-        "Vowels":     _gauss2d(rates, scales, 3.0, 4.0, 0.55, 0.55, 1.0),
-        "Stops":      _gauss2d(rates, scales, 20.0, 0.5, 0.55, 0.55, 1.0),
-        "Fricatives": _gauss2d(rates, scales, 10.0, 3.0, 0.65, 0.65, 1.0),
-        "Nasals":     _gauss2d(rates, scales, 2.0, 1.5, 0.55, 0.65, 1.0),
-    }
-    # Flatten templates to filter-vectors of length n_filters.
-    template_vecs = {
-        k: v.flatten()[:n_filters] for k, v in family_templates.items()
-    }
-
-    phones: List[str] = []
-    families: List[str] = []
-    rows: List[np.ndarray] = []
-    for fam, plist in PHONEMES_BY_FAMILY.items():
-        base = template_vecs[fam]
-        base = base / (np.linalg.norm(base) + 1e-8)
-        for p in plist:
-            jitter = 0.18 * rng.standard_normal(n_filters)
-            row = base + jitter
-            rows.append(row)
-            phones.append(p)
-            families.append(fam)
-
-    W = np.vstack(rows)  # (39, n_filters)
-    return W, phones, families
-
-
-def dummy_cortical_trajectory(
-    n_frames: int = 240,
-    seed: int = 3,
-) -> Tuple[np.ndarray, List[str], List[Tuple[int, str]]]:
-    """Dummy time-resolved cortical importance trajectory for the word 'stop'.
+def marginalise_by_rate(res: LimeResults) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-utterance marginal |importance| over unique temporal-rate bins.
 
     Returns
     -------
-    trajectory : (n_filters_subset, n_frames) float array in [0, 1]
-    filter_labels : names of the cortical filter bands
-    boundaries : list of (frame_idx, phone_symbol) tuples
+    rates_unique : (R,) sorted unique rate values
+    samples      : (N, R)  mean |importance| per utterance per rate bin
     """
-    rng = np.random.default_rng(seed)
-    filter_labels = [
-        "High Rate / Low Scale\n(Stops)",
-        "Low Rate / High Scale\n(Vowels)",
-        "Mid Rate / High Scale\n(Fricatives)",
-    ]
-    n_filters = len(filter_labels)
-    T = n_frames
+    abs_imp = np.abs(res.importances)
+    rates = res.rates
+    rates_unique = _unique_axis_values(rates)
+    out = np.zeros((abs_imp.shape[0], rates_unique.size), dtype=np.float64)
+    for j, r in enumerate(rates_unique):
+        mask = np.isclose(rates, r)
+        out[:, j] = abs_imp[:, mask].mean(axis=1)
+    return rates_unique, out
 
-    # Phoneme boundaries for /s/ /t/ /aa/ /p/ with relative durations
-    durations = np.array([0.28, 0.14, 0.38, 0.20])  # sum = 1
-    durations = durations / durations.sum()
-    edges = np.concatenate([[0], np.cumsum(durations) * T]).astype(int)
-    phones = ["/s/", "/t/", "/aa/", "/p/"]
-    boundaries = [(int(edges[i]), phones[i]) for i in range(len(phones))]
 
-    traj = np.zeros((n_filters, T), dtype=np.float64)
-    t = np.arange(T)
+def grid_by_scale_rate(
+    mean_vec: np.ndarray,
+    sr_pairs: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reshape a (S,) vector into a (n_scales, n_rates) grid.
 
-    def bump(center: float, width: float, amp: float = 1.0) -> np.ndarray:
-        return amp * np.exp(-((t - center) ** 2) / (2 * width ** 2))
-
-    # /s/ → Fricatives filter active
-    s_center = (edges[0] + edges[1]) / 2
-    traj[2] += bump(s_center, (edges[1] - edges[0]) / 2.5, amp=0.95)
-    # /t/ → Stops filter spikes sharply at burst onset
-    t_center = edges[1] + 2
-    traj[0] += bump(t_center, (edges[2] - edges[1]) / 3.5, amp=1.0)
-    # /aa/ → Vowels filter sustained, strong
-    a_center = (edges[2] + edges[3]) / 2
-    traj[1] += bump(a_center, (edges[3] - edges[2]) / 2.2, amp=1.0)
-    # /p/ → Stops burst, slightly weaker than /t/
-    p_center = (edges[3] + edges[4]) / 2
-    traj[0] += bump(p_center, (edges[4] - edges[3]) / 2.8, amp=0.85)
-
-    traj += 0.04 * rng.standard_normal(traj.shape)
-    traj = np.clip(traj, 0.0, None)
-    traj /= traj.max()
-    return traj, filter_labels, boundaries
+    The model's STRF bank may store duplicates (e.g. upward / downward FM);
+    we average within each (scale, rate) cell.
+    """
+    scales = _unique_axis_values(sr_pairs[:, 0])
+    rates = _unique_axis_values(sr_pairs[:, 1])
+    grid = np.full((scales.size, rates.size), np.nan, dtype=np.float64)
+    count = np.zeros_like(grid)
+    for v, (sc, rt) in zip(mean_vec, sr_pairs):
+        i = int(np.argmin(np.abs(scales - sc)))
+        j = int(np.argmin(np.abs(rates - rt)))
+        if np.isnan(grid[i, j]):
+            grid[i, j] = 0.0
+        grid[i, j] += v
+        count[i, j] += 1
+    with np.errstate(invalid="ignore"):
+        grid = grid / np.where(count == 0, 1, count)
+    grid[count == 0] = 0.0
+    return grid, scales, rates
 
 
 # =============================================================================
-#                                PLOT 1 – RHYTHM
+#                     PLOT 1 — TEMPORAL RATE MARGINAL IMPORTANCE
 # =============================================================================
 
 def plot_temporal_rate_marginal(
-    importances: np.ndarray,
-    rates: np.ndarray = TEMPORAL_RATES_HZ,
+    res: LimeResults,
     ci: float = 95.0,
-    ax: plt.Axes | None = None,
     highlight: Tuple[float, float] = (2.0, 8.0),
 ) -> plt.Figure:
-    """Plot 1 – Temporal Rate Marginal Importance ("The Rhythmic Signature")."""
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6.4, 3.8))
-    else:
-        fig = ax.figure
+    """Plot 1 – Temporal-rate marginal importance (the Rhythmic Signature).
 
-    mean = importances.mean(axis=0)
-    lo = np.percentile(importances, (100 - ci) / 2, axis=0)
-    hi = np.percentile(importances, 100 - (100 - ci) / 2, axis=0)
+    For each unique temporal-rate value in the STRF bank, computes the mean
+    absolute importance across all explained utterances and plots the mean
+    curve with a 95 % shaded confidence interval. Highlights the 2-8 Hz
+    stress-timed band and annotates the rate at which the peak occurs.
+    """
+    rates_unique, samples = marginalise_by_rate(res)
+    mean = samples.mean(axis=0)
+    lo = np.percentile(samples, (100 - ci) / 2, axis=0)
+    hi = np.percentile(samples, 100 - (100 - ci) / 2, axis=0)
 
+    fig, ax = plt.subplots(figsize=(6.6, 3.9))
     colour = FAMILY_COLORS["Vowels"]
-    ax.fill_between(rates, lo, hi, color=colour, alpha=0.22,
-                    label=f"{ci:.0f}% CI")
-    ax.plot(rates, mean, color=colour, lw=2.2, marker="o", ms=5,
-            mfc="white", mec=colour, mew=1.3, label="Mean |importance|")
 
-    # Shade the English stress-timing band.
     ax.axvspan(*highlight, color="#F4A261", alpha=0.18,
                label="Stress-timed band (2–8 Hz)")
+    ax.fill_between(rates_unique, lo, hi, color=colour, alpha=0.22,
+                    label=f"{ci:.0f} % CI")
+    ax.plot(rates_unique, mean, color=colour, lw=2.2, marker="o", ms=5,
+            mfc="white", mec=colour, mew=1.3, label="Mean |importance|")
+
+    # Annotate the peak.
+    j_peak = int(np.argmax(mean))
+    r_peak = rates_unique[j_peak]
+    ax.annotate(
+        f"Peak at {r_peak:.1f} Hz",
+        xy=(r_peak, mean[j_peak]),
+        xytext=(r_peak * 1.6, mean[j_peak] * 1.05),
+        arrowprops=dict(arrowstyle="->", lw=0.9, color="black"),
+        fontsize=10, ha="left",
+    )
 
     ax.set_xscale("log", base=2)
-    ax.set_xticks(rates)
-    ax.set_xticklabels([f"{r:g}" for r in rates])
+    ax.set_xticks(rates_unique)
+    ax.set_xticklabels([f"{r:g}" for r in rates_unique])
     ax.set_xlabel(r"Temporal rate $\omega$ (Hz)")
     ax.set_ylabel(r"Mean $|$importance$|$")
-    ax.set_title("The Rhythmic Signature:\nTemporal Rate Marginal Importance")
+    ax.set_title("The Rhythmic Signature:\nTemporal-Rate Marginal Importance")
     ax.grid(True, axis="y", ls=":", lw=0.6, alpha=0.55)
     ax.legend(loc="upper right")
     _despine(ax)
@@ -334,28 +295,59 @@ def plot_temporal_rate_marginal(
 
 
 # =============================================================================
-#                           PLOT 2 – MANNER HEATMAPS
+#                     PLOT 2 — MANNER-OF-ARTICULATION HEATMAPS
 # =============================================================================
 
+def _family_mean_grid(
+    phone_means: Dict[str, np.ndarray],
+    family: str,
+    sr_pairs: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    members = [p for p in PHONEMES_BY_FAMILY[family] if p in phone_means]
+    if not members:
+        return (
+            np.zeros((1, 1)),
+            _unique_axis_values(sr_pairs[:, 0]),
+            _unique_axis_values(sr_pairs[:, 1]),
+        )
+    stacked = np.stack([phone_means[p] for p in members], 0).mean(0)
+    return grid_by_scale_rate(stacked, sr_pairs)
+
+
 def plot_manner_heatmaps(
-    manner_maps: Dict[str, np.ndarray],
-    rates: np.ndarray = TEMPORAL_RATES_HZ,
-    scales: np.ndarray = SPECTRAL_SCALES_CPO,
+    res: LimeResults,
+    phone_means: Optional[Dict[str, np.ndarray]] = None,
 ) -> plt.Figure:
-    """Plot 2 – Manner-of-articulation heatmaps ("Phonetic Universals")."""
+    """Plot 2 – Manner-of-articulation heatmaps (Phonetic Universals).
+
+    For each manner class (vowels, stops, fricatives), averages CorticalLIME
+    importance across member phones, folds the (S,) vector onto the
+    (scale × rate) grid of the STRF bank, and renders a 2-D heatmap. Axes
+    are shared and a common colour bar conveys the normalised importance.
+    """
+    if phone_means is None:
+        phone_means = aggregate_per_phoneme(res)
+
     order = ["Vowels", "Stops", "Fricatives"]
+    grids: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {
+        k: _family_mean_grid(phone_means, k, res.sr_pairs) for k in order
+    }
+    # Normalise jointly so panels are comparable.
+    gmax = max(g[0].max() for g in grids.values()) + 1e-12
+    for k in order:
+        g, s, r = grids[k]
+        grids[k] = (g / gmax, s, r)
+
     fig, axes = plt.subplots(
-        1, 3, figsize=(12.2, 3.9), sharey=True,
+        1, 3, figsize=(12.4, 4.0), sharey=True,
         gridspec_kw={"wspace": 0.18},
     )
-
-    vmax = max(m.max() for m in manner_maps.values())
     im = None
     for ax, name in zip(axes, order):
-        M = manner_maps[name]  # (n_scales, n_rates)
+        M, scales, rates = grids[name]
         im = ax.imshow(
             M, origin="lower", aspect="auto", cmap=SEQ_CMAP,
-            vmin=0.0, vmax=vmax,
+            vmin=0.0, vmax=1.0,
             extent=[-0.5, len(rates) - 0.5, -0.5, len(scales) - 0.5],
         )
         ax.set_xticks(np.arange(len(rates)))
@@ -363,14 +355,15 @@ def plot_manner_heatmaps(
         ax.set_yticks(np.arange(len(scales)))
         ax.set_yticklabels([f"{s:g}" for s in scales])
         ax.set_xlabel(r"Temporal rate $\omega$ (Hz)")
-        ax.set_title(f"({'abc'[order.index(name)]})  {name}",
+        ax.set_title(f"({'abc'[order.index(name)]}) {name}",
                      color=FAMILY_COLORS[name])
         _despine(ax)
 
     axes[0].set_ylabel(r"Spectral scale $\Omega$ (cyc / oct)")
-    fig.suptitle("Phonetic Universals:\nCortical Importance by Manner of Articulation",
-                 fontsize=14, fontweight="bold", y=1.04)
-
+    fig.suptitle(
+        "Phonetic Universals:\nCortical Importance by Manner of Articulation",
+        fontsize=14, fontweight="bold", y=1.04,
+    )
     cbar = fig.colorbar(im, ax=axes, shrink=0.88, pad=0.02, aspect=22)
     cbar.set_label(r"Normalised $|$importance$|$")
     cbar.outline.set_visible(False)
@@ -378,42 +371,87 @@ def plot_manner_heatmaps(
 
 
 # =============================================================================
-#                         PLOT 3 – PHONETIC DENDROGRAM
+#                 PLOT 3 — UNSUPERVISED PHONETIC TAXONOMY
 # =============================================================================
 
+def _link_color_map(
+    Z: np.ndarray, families: Sequence[str], family_colors: Dict[str, str],
+    default: str = "#8A8A8A",
+) -> Dict[int, str]:
+    """Map every internal node of ``Z`` to a colour.
+
+    A link is coloured with a family's colour iff *all* leaves under it
+    belong to that family; otherwise it is neutral grey. This guarantees
+    the dendrogram branch colours are consistent with the leaf-label
+    colours — a link inherits a family colour only when its subtree is
+    pure. The top of the tree (the sonorant/obstruent split) is grey.
+    """
+    n = len(families)
+    leaves_under: Dict[int, set] = {i: {i} for i in range(n)}
+    for i, row in enumerate(Z):
+        a, b = int(row[0]), int(row[1])
+        leaves_under[n + i] = leaves_under[a] | leaves_under[b]
+
+    colors: Dict[int, str] = {}
+    for node_id in range(n, 2 * n - 1):
+        fams = {families[idx] for idx in leaves_under[node_id]}
+        if len(fams) == 1:
+            colors[node_id] = family_colors[next(iter(fams))]
+        else:
+            colors[node_id] = default
+    return colors
+
+
+def _ordered_phone_weight_matrix(
+    phone_means: Dict[str, np.ndarray],
+) -> Tuple[np.ndarray, List[str], List[str]]:
+    phones: List[str] = []
+    families: List[str] = []
+    rows: List[np.ndarray] = []
+    for fam in ["Vowels", "Stops", "Fricatives", "Nasals"]:
+        for p in PHONEMES_BY_FAMILY[fam]:
+            if p in phone_means:
+                phones.append(p)
+                families.append(fam)
+                rows.append(phone_means[p])
+    if not rows:
+        raise ValueError("No TIMIT-39 phones found in results.")
+    return np.vstack(rows), phones, families
+
+
 def plot_phonetic_dendrogram(
-    W: np.ndarray,
-    phones: Sequence[str],
-    families: Sequence[str],
+    res: LimeResults,
+    phone_means: Optional[Dict[str, np.ndarray]] = None,
     method: str = "ward",
     metric: str = "euclidean",
 ) -> plt.Figure:
-    """Plot 3 – Unsupervised phonetic dendrogram ("The Aha! Moment").
+    """Plot 3 – Unsupervised phonetic taxonomy.
 
-    Hierarchical clustering of the (phonemes × filters) CorticalLIME weight
-    matrix, with branches & leaf labels colour-coded by manner family.
+    Hierarchical clustering (Ward linkage) of the (N_phones × S_filters)
+    mean CorticalLIME weight matrix. Branch colours and leaf labels are
+    painted with the same manner-class palette (strict match: a branch
+    inherits a family colour only if its entire subtree is pure in that
+    family). The two highest-level clusters are annotated as "Sonorants"
+    and "Obstruents" to guide the reader.
     """
-    assert W.shape[0] == len(phones) == len(families)
+    if phone_means is None:
+        phone_means = aggregate_per_phoneme(res)
 
+    W, phones, families = _ordered_phone_weight_matrix(phone_means)
     Z = linkage(W, method=method, metric=metric)
+    link_colors = _link_color_map(Z, families, FAMILY_COLORS)
 
-    # Supply a per-family colour palette for the dendrogram link colouring.
-    palette = [FAMILY_COLORS[f] for f in ["Vowels", "Stops", "Fricatives",
-                                          "Nasals"]]
-    set_link_color_palette(palette)
-
-    fig, ax = plt.subplots(figsize=(7.2, 8.8))
+    fig, ax = plt.subplots(figsize=(7.8, 9.4))
     ddata = dendrogram(
         Z,
         orientation="right",
-        labels=list(phones),
+        labels=phones,
         leaf_font_size=10,
-        color_threshold=0.7 * np.max(Z[:, 2]),
+        link_color_func=lambda k: link_colors.get(k, "#8A8A8A"),
         above_threshold_color="#8A8A8A",
         ax=ax,
     )
-
-    # Colour the leaf labels by family.
+    # Colour leaf labels by family.
     fam_of = dict(zip(phones, families))
     for lbl in ax.get_ymajorticklabels():
         p = lbl.get_text()
@@ -421,138 +459,254 @@ def plot_phonetic_dendrogram(
         lbl.set_fontweight("bold")
 
     ax.set_xlabel("Ward linkage distance")
-    ax.set_title("The Aha! Moment:\nUnsupervised Phonetic Taxonomy from CorticalLIME Weights",
-                 pad=14)
+    ax.set_title(
+        "Emergent Phonetic Taxonomy:\n"
+        "Unsupervised Hierarchical Clustering of CorticalLIME Weights",
+        pad=14,
+    )
     _despine(ax)
     ax.spines["left"].set_visible(False)
     ax.tick_params(axis="y", length=0)
     ax.grid(True, axis="x", ls=":", lw=0.6, alpha=0.55)
 
-    # Manual legend for the four families.
+    # ── Sonorant / Obstruent annotations ─────────────────────────────────
+    ordered_phones = [t.get_text() for t in ax.get_ymajorticklabels()]
+    ordered_fams = [fam_of[p] for p in ordered_phones]
+    sonorant_set = {"Vowels", "Nasals"}
+    obstruent_set = {"Stops", "Fricatives"}
+
+    def _yrange(target: set) -> Optional[Tuple[float, float]]:
+        idxs = [i for i, f in enumerate(ordered_fams) if f in target]
+        if not idxs:
+            return None
+        return (10 * (min(idxs) + 0.5) - 4, 10 * (max(idxs) + 0.5) + 4)
+
+    x_max = float(np.max(Z[:, 2]))
+    x_anno = x_max * 1.03
+    ax.set_xlim(right=x_max * 1.22)
+
+    for label, target, color in [
+        ("Sonorants\n(Vowels + Nasals)", sonorant_set, "#3A3A3A"),
+        ("Obstruents\n(Stops + Fricatives)", obstruent_set, "#3A3A3A"),
+    ]:
+        yr = _yrange(target)
+        if yr is None:
+            continue
+        y0, y1 = yr
+        ax.annotate(
+            "",
+            xy=(x_anno, y0), xytext=(x_anno, y1),
+            arrowprops=dict(arrowstyle="-", lw=1.6, color=color),
+            annotation_clip=False,
+        )
+        ax.text(
+            x_anno + (x_max * 0.03), (y0 + y1) / 2, label,
+            va="center", ha="left", fontsize=10, fontweight="bold",
+            color=color,
+        )
+
     handles = [
         plt.Line2D([0], [0], color=FAMILY_COLORS[f], lw=3, label=f)
         for f in ["Vowels", "Stops", "Fricatives", "Nasals"]
     ]
-    ax.legend(handles=handles, loc="lower right", title="Manner family",
+    ax.legend(handles=handles, loc="lower right", title="Manner class",
               title_fontsize=9)
     fig.tight_layout()
     return fig
 
 
 # =============================================================================
-#                       PLOT 4 – CORTICAL TRAJECTORY
+#                   PLOT 4 — DYNAMIC CORTICAL TRAJECTORIES
 # =============================================================================
 
-def plot_cortical_trajectory(
-    trajectory: np.ndarray,
-    filter_labels: Sequence[str],
+# Filter categorisation used to build per-frame trajectory rows.
+FILTER_GROUPS: List[Tuple[str, str]] = [
+    ("High Rate / Low Scale\n(Stops)",      "Stops"),
+    ("Low Rate / High Scale\n(Vowels)",     "Vowels"),
+    ("Mid Rate / High Scale\n(Fricatives)", "Fricatives"),
+]
+
+
+def categorise_filters(sr_pairs: np.ndarray) -> Dict[str, np.ndarray]:
+    """Partition STRF channels into three linguistically-motivated groups.
+
+    The (scale, rate) thresholds follow Chi, Ru & Shamma (2005):
+        Vowels     →  rate  ≤ 8 Hz  and  scale ≥ 2 cyc/oct
+        Stops      →  rate  ≥ 11 Hz and  scale ≤ 1 cyc/oct
+        Fricatives →  rate  ≥ 5 Hz  and  scale ≥ 1 cyc/oct (excl. Vowels/Stops)
+    """
+    scale = sr_pairs[:, 0]
+    rate = sr_pairs[:, 1]
+
+    vowels = (rate <= 8.0) & (scale >= 2.0)
+    stops = (rate >= 11.0) & (scale <= 1.0)
+    fricatives = (rate >= 5.0) & (scale >= 1.0) & ~vowels & ~stops
+
+    return {
+        "Vowels": np.where(vowels)[0],
+        "Stops": np.where(stops)[0],
+        "Fricatives": np.where(fricatives)[0],
+    }
+
+
+def _plot_single_trajectory(
+    ax: plt.Axes,
+    traj: np.ndarray,
     boundaries: Sequence[Tuple[int, str]],
-    word: str = "stop",
-) -> plt.Figure:
-    """Plot 4 – Dynamic cortical trajectory ("Time-Series Shift")."""
-    n_filt, T = trajectory.shape
-
-    fig, ax = plt.subplots(figsize=(9.2, 4.2))
+    word: str,
+    filter_labels: Sequence[str],
+    show_ylabels: bool = True,
+) -> "mpl.image.AxesImage":
+    n_g, T = traj.shape
     im = ax.imshow(
-        trajectory, aspect="auto", origin="lower", cmap=SEQ_CMAP,
-        extent=[0, T, -0.5, n_filt - 0.5],
+        traj, aspect="auto", origin="lower", cmap=SEQ_CMAP,
+        vmin=0.0, vmax=1.0,
+        extent=[0, T, -0.5, n_g - 0.5],
     )
-
-    ax.set_yticks(np.arange(n_filt))
-    ax.set_yticklabels(filter_labels)
+    ax.set_yticks(np.arange(n_g))
+    if show_ylabels:
+        ax.set_yticklabels(filter_labels)
+    else:
+        ax.set_yticklabels([])
     ax.set_xlabel("Time frame")
-    ax.set_title(f"Time-Series Shift:\nCortical Importance Trajectory for the word “{word}”",
-                 pad=12)
+    ax.set_title(f"“{word}”", pad=6)
 
-    # Dashed phoneme boundaries + labels.
-    edges = [b[0] for b in boundaries] + [T]
+    edges = [int(b[0]) for b in boundaries] + [T]
     for b_idx, (frame, phn) in enumerate(boundaries):
-        ax.axvline(frame, color="white", ls="--", lw=1.1, alpha=0.85)
+        ax.axvline(frame, color="white", ls="--", lw=1.0, alpha=0.9)
         center = (edges[b_idx] + edges[b_idx + 1]) / 2
         ax.text(
-            center, n_filt - 0.35, phn,
+            center, n_g - 0.35, phn,
             ha="center", va="top", color="white",
-            fontsize=11, fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="none",
+            fontsize=9, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.18", fc="black", ec="none",
                       alpha=0.55),
         )
-    # Final trailing edge marker
-    ax.axvline(T, color="white", ls="--", lw=1.1, alpha=0.85)
-
+    ax.axvline(T, color="white", ls="--", lw=1.0, alpha=0.9)
     _despine(ax)
-    cbar = fig.colorbar(im, ax=ax, pad=0.02, shrink=0.9, aspect=18)
-    cbar.set_label(r"Normalised $|$importance$|$")
+    return im
+
+
+def plot_cortical_trajectory_panel(
+    trajectories: List[Dict],
+    filter_labels: Sequence[str] = (fl for fl, _ in FILTER_GROUPS),
+    title: str = "Dynamic Cortical Trajectories",
+) -> plt.Figure:
+    """Plot 4 – One figure containing 5 stacked word trajectories.
+
+    Each row shows a single word's time-resolved cortical saliency
+    (``|LIME importance| × per-frame cortical energy``, aggregated by
+    filter category). Dashed white lines mark phoneme boundaries.
+    """
+    filter_labels = list(filter_labels)
+    n = len(trajectories)
+    fig, axes = plt.subplots(
+        n, 1, figsize=(9.0, 2.1 * n + 0.6), sharex=False,
+    )
+    if n == 1:
+        axes = [axes]
+    im = None
+    for i, (ax, td) in enumerate(zip(axes, trajectories)):
+        im = _plot_single_trajectory(
+            ax, td["trajectory"], td["boundaries"], td["word"],
+            filter_labels, show_ylabels=True,
+        )
+    fig.suptitle(title, fontsize=14, fontweight="bold", y=1.0)
+    fig.tight_layout(rect=[0.0, 0.0, 0.95, 0.98])
+    cbar = fig.colorbar(im, ax=axes, shrink=0.85, pad=0.02, aspect=30)
+    cbar.set_label(r"Normalised saliency")
     cbar.outline.set_visible(False)
-    fig.tight_layout()
     return fig
 
 
+def load_trajectories(path: str) -> List[Dict]:
+    """Load ``trajectories.npz`` written by ``run.py``.
+
+    The file stores an object array of per-word dicts with keys
+    ``word``, ``trajectory`` (n_groups × T), and ``boundaries``
+    (list of (frame_idx, phone) tuples).
+    """
+    with np.load(path, allow_pickle=True) as d:
+        arr = d["trajectories"]
+    return [dict(x) for x in arr.tolist()]
+
+
 # =============================================================================
-#                                   MAIN
+#                             TOP-LEVEL RENDERING
 # =============================================================================
 
-@dataclass
-class FigurePaths:
-    outdir: str
+def render_all(
+    results_path: str,
+    trajectories_path: Optional[str] = None,
+    outdir: str = "figures_lingo",
+) -> Dict[str, str]:
+    """Produce all five figures.
 
-    def path(self, name: str) -> str:
-        os.makedirs(self.outdir, exist_ok=True)
-        return os.path.join(self.outdir, name)
-
-
-def render_all(outdir: str = "figures", seed: int = 0) -> Dict[str, str]:
-    """Generate all four figures from dummy data and save as PNGs."""
+    Parameters
+    ----------
+    results_path : path to ``results_raw.npz``
+    trajectories_path : path to ``trajectories.npz`` (optional; if absent,
+        Plot 4 panels are skipped).
+    outdir : directory to write PNGs into.
+    """
     set_academic_style()
-    paths = FigurePaths(outdir)
+    os.makedirs(outdir, exist_ok=True)
     written: Dict[str, str] = {}
 
-    # ── Plot 1 ────────────────────────────────────────────────────────────
-    samples = dummy_temporal_rate_importance(seed=seed)
-    fig1 = plot_temporal_rate_marginal(samples)
-    p1 = paths.path("fig1_temporal_rate_marginal.png")
-    fig1.savefig(p1)
-    plt.close(fig1)
-    written["fig1"] = p1
+    res = load_lime_results(results_path)
+    phone_means = aggregate_per_phoneme(res)
 
-    # ── Plot 2 ────────────────────────────────────────────────────────────
-    manner = dummy_manner_heatmaps(seed=seed + 1)
-    fig2 = plot_manner_heatmaps(manner)
-    p2 = paths.path("fig2_manner_heatmaps.png")
-    fig2.savefig(p2)
-    plt.close(fig2)
-    written["fig2"] = p2
+    fig1 = plot_temporal_rate_marginal(res)
+    p1 = os.path.join(outdir, "fig1_temporal_rate_marginal.png")
+    fig1.savefig(p1); plt.close(fig1); written["fig1"] = p1
 
-    # ── Plot 3 ────────────────────────────────────────────────────────────
-    W, phones, families = dummy_phonetic_weight_matrix(seed=seed + 2)
-    fig3 = plot_phonetic_dendrogram(W, phones, families)
-    p3 = paths.path("fig3_phonetic_dendrogram.png")
-    fig3.savefig(p3)
-    plt.close(fig3)
-    written["fig3"] = p3
+    fig2 = plot_manner_heatmaps(res, phone_means)
+    p2 = os.path.join(outdir, "fig2_manner_heatmaps.png")
+    fig2.savefig(p2); plt.close(fig2); written["fig2"] = p2
 
-    # ── Plot 4 ────────────────────────────────────────────────────────────
-    traj, flabels, bounds = dummy_cortical_trajectory(seed=seed + 3)
-    fig4 = plot_cortical_trajectory(traj, flabels, bounds, word="stop")
-    p4 = paths.path("fig4_cortical_trajectory.png")
-    fig4.savefig(p4)
-    plt.close(fig4)
-    written["fig4"] = p4
+    fig3 = plot_phonetic_dendrogram(res, phone_means)
+    p3 = os.path.join(outdir, "fig3_phonetic_taxonomy.png")
+    fig3.savefig(p3); plt.close(fig3); written["fig3"] = p3
+
+    if trajectories_path is not None and os.path.exists(trajectories_path):
+        trajs = load_trajectories(trajectories_path)
+        # Split into two figures of 5 words each.
+        first = trajs[:5]
+        second = trajs[5:10]
+        if first:
+            f4a = plot_cortical_trajectory_panel(
+                first,
+                title="Dynamic Cortical Trajectories (I/II):\n"
+                      "Temporal Saliency Across Five Representative Words",
+            )
+            p4a = os.path.join(outdir, "fig4a_cortical_trajectory.png")
+            f4a.savefig(p4a); plt.close(f4a); written["fig4a"] = p4a
+        if second:
+            f4b = plot_cortical_trajectory_panel(
+                second,
+                title="Dynamic Cortical Trajectories (II/II):\n"
+                      "Temporal Saliency Across Five Representative Words",
+            )
+            p4b = os.path.join(outdir, "fig4b_cortical_trajectory.png")
+            f4b.savefig(p4b); plt.close(f4b); written["fig4b"] = p4b
 
     return written
 
 
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--outdir", default="figures",
-                    help="directory to write PNGs to (default: ./figures)")
-    ap.add_argument("--seed", type=int, default=0,
-                    help="RNG seed for dummy data")
+    ap.add_argument("--results", required=True,
+                    help="path to results_raw.npz")
+    ap.add_argument("--trajectories", default=None,
+                    help="path to trajectories.npz (optional)")
+    ap.add_argument("--outdir", default="figures_lingo",
+                    help="directory to write PNGs to")
     return ap.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    written = render_all(outdir=args.outdir, seed=args.seed)
+    written = render_all(args.results, args.trajectories, args.outdir)
     print("Saved figures:")
     for k, v in written.items():
         print(f"  {k}: {v}")
