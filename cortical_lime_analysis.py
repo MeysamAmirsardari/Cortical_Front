@@ -191,7 +191,7 @@ def analysis_A_dataset_overview(ds: TIMITDataset, out: Path):
     ax.invert_yaxis()
     ax.set_xlabel("Total frames")
     ax.set_title(f"Phone distribution (top 30, {s['n_utterances']} utterances)")
-    fig.savefig(out / "A1_phone_distribution.pdf")
+    fig.savefig(out / "A1_phone_distribution.png")
     plt.close(fig)
 
     # Figure A2: Duration histogram.
@@ -201,7 +201,7 @@ def analysis_A_dataset_overview(ds: TIMITDataset, out: Path):
     ax.set_xlabel("Utterance duration (s)")
     ax.set_ylabel("Count")
     ax.set_title("Utterance duration distribution")
-    fig.savefig(out / "A2_duration_hist.pdf")
+    fig.savefig(out / "A2_duration_hist.png")
     plt.close(fig)
 
     # Figure A3: Dialect region counts.
@@ -214,7 +214,7 @@ def analysis_A_dataset_overview(ds: TIMITDataset, out: Path):
     ax.set_xlabel("Dialect region")
     ax.set_ylabel("Utterances")
     ax.set_title("Dialect region coverage")
-    fig.savefig(out / "A3_dialect_regions.pdf")
+    fig.savefig(out / "A3_dialect_regions.png")
     plt.close(fig)
     print("  Figures saved: A1, A2, A3")
 
@@ -265,7 +265,7 @@ def analysis_B_single_utterance(
         f'XAI comparison — /{phn}/  (P={result.target_prob:.3f})',
         y=1.02, fontsize=13,
     )
-    fig.savefig(out / "B1_three_methods.pdf")
+    fig.savefig(out / "B1_three_methods.png")
     plt.close(fig)
 
     # Figure B2: Surrogate diagnostics.
@@ -284,7 +284,7 @@ def analysis_B_single_utterance(
 
     axes[2].hist(result.weights, bins=30, color="#2a7f62", edgecolor="white", lw=0.3)
     axes[2].set(xlabel="Kernel weight", ylabel="Count", title="Kernel weights")
-    fig.savefig(out / "B2_surrogate_diagnostics.pdf")
+    fig.savefig(out / "B2_surrogate_diagnostics.png")
     plt.close(fig)
 
     # Figure B3: Bootstrap CIs.
@@ -303,7 +303,7 @@ def analysis_B_single_utterance(
             ax.scatter(i, boot_hi[order][i] + 0.002, marker="*", color="goldenrod", s=25, zorder=5)
     ax.set(xlabel="STRF channel (sorted)", ylabel="Coefficient",
            title=f"95% bootstrap CIs — {int(sig.sum())}/{len(sig)} significant")
-    fig.savefig(out / "B3_bootstrap_ci.pdf")
+    fig.savefig(out / "B3_bootstrap_ci.png")
     plt.close(fig)
 
     # Cross-method agreement.
@@ -397,7 +397,7 @@ def analysis_C_faithfulness(
         ax.set(xlabel=f"{title}  ({direction})", ylabel="Count")
         ax.set_title(title)
         ax.legend()
-    fig.savefig(out / "C1_faithfulness_distributions.pdf")
+    fig.savefig(out / "C1_faithfulness_distributions.png")
     plt.close(fig)
 
     # Figure C2: AOPC vs Infidelity scatter.
@@ -406,7 +406,7 @@ def analysis_C_faithfulness(
     ax.set_xlabel("AOPC (↑ better)")
     ax.set_ylabel("Infidelity (↓ better)")
     ax.set_title("Faithfulness: AOPC vs Infidelity per utterance")
-    fig.savefig(out / "C2_aopc_vs_infidelity.pdf")
+    fig.savefig(out / "C2_aopc_vs_infidelity.png")
     plt.close(fig)
     print("  Figures saved: C1, C2")
 
@@ -447,7 +447,7 @@ def analysis_D_stability(
                 capsize=1.5, color="#2a7f62", edgecolor="white", lw=0.3)
     axes[1].axhline(0, color="k", lw=0.5)
     axes[1].set(xlabel="STRF (sorted)", ylabel="Coef", title="Mean ± std across seeds")
-    fig.savefig(out / "D1_stability.pdf")
+    fig.savefig(out / "D1_stability.png")
     plt.close(fig)
     print("  Figure saved: D1")
 
@@ -488,7 +488,7 @@ def analysis_E_phoneme_profiles(
     for ax in axes[n_show:]:
         ax.set_visible(False)
     fig.suptitle("Mean CorticalLIME importance per predicted phoneme", y=1.01, fontsize=13)
-    fig.savefig(out / "E1_phoneme_profiles.pdf")
+    fig.savefig(out / "E1_phoneme_profiles.png")
     plt.close(fig)
 
     # Figure E2: Mean absolute importance per phoneme (bar chart).
@@ -502,7 +502,7 @@ def analysis_E_phoneme_profiles(
     ax.set_xticklabels([f"/{p}/" for p in sorted_phns], rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Mean |importance|")
     ax.set_title("Phonemes ranked by mean absolute STRF importance")
-    fig.savefig(out / "E2_importance_magnitude.pdf")
+    fig.savefig(out / "E2_importance_magnitude.png")
     plt.close(fig)
     print(f"  {len(profiles)} phoneme profiles built. Figures saved: E1, E2")
     return profiles
@@ -539,7 +539,7 @@ def analysis_F_manner(profiles: dict, sr_pairs: np.ndarray, out: Path):
     ax.set(xlabel="STRF channel (sorted)", ylabel="Mean coefficient",
            title="Manner-of-articulation importance profiles")
     ax.legend(ncol=2, fontsize=8)
-    fig.savefig(out / "F1_manner_profiles.pdf")
+    fig.savefig(out / "F1_manner_profiles.png")
     plt.close(fig)
 
     # Figure F2: Effect sizes for key comparisons.
@@ -564,7 +564,7 @@ def analysis_F_manner(profiles: dict, sr_pairs: np.ndarray, out: Path):
             fa, fb = pair.split("_vs_")
             ax.set_title(f"Cohen's d: {fa} − {fb}", fontsize=10)
         axes[0].set_ylabel(r"$\Omega$ (cyc/oct)")
-        fig.savefig(out / "F2_manner_effect_sizes.pdf")
+        fig.savefig(out / "F2_manner_effect_sizes.png")
         plt.close(fig)
 
     print("  Figures saved: F1, F2")
@@ -605,7 +605,7 @@ def analysis_G_voicing(profiles: dict, sr_pairs: np.ndarray, out: Path):
         ax.set_title(f"/{v}/ − /{uv}/", fontsize=10)
     axes[0].set_ylabel(r"$\Omega$ (cyc/oct)")
     fig.suptitle("Voicing contrasts (voiced − voiceless)", y=1.02, fontsize=13)
-    fig.savefig(out / "G1_voicing_contrasts.pdf")
+    fig.savefig(out / "G1_voicing_contrasts.png")
     plt.close(fig)
     print(f"  {len(pairs_with_data)} pairs plotted. Figure saved: G1")
 
@@ -636,7 +636,7 @@ def analysis_H_place(profiles: dict, sr_pairs: np.ndarray, out: Path):
     ax.set(xlabel="STRF channel (sorted)", ylabel="Mean coefficient",
            title="Place-of-articulation importance profiles")
     ax.legend()
-    fig.savefig(out / "H1_place_profiles.pdf")
+    fig.savefig(out / "H1_place_profiles.png")
     plt.close(fig)
     print("  Figure saved: H1")
 
@@ -675,7 +675,7 @@ def analysis_I_utilisation(results: list, sr_pairs: np.ndarray, out: Path):
     axes[1].set_ylabel(r"$\Omega$ (cyc/oct)")
     axes[1].set_title("CV of importance (high = class-specific)")
     fig.colorbar(sc, ax=axes[1], label="CV", shrink=0.85)
-    fig.savefig(out / "I1_filter_utilisation.pdf")
+    fig.savefig(out / "I1_filter_utilisation.png")
     plt.close(fig)
 
     # Figure I2: Importance correlation matrix between channels.
@@ -685,7 +685,7 @@ def analysis_I_utilisation(results: list, sr_pairs: np.ndarray, out: Path):
     ax.set(xlabel="STRF channel", ylabel="STRF channel",
            title="Inter-channel importance correlation")
     fig.colorbar(im, ax=ax, shrink=0.85)
-    fig.savefig(out / "I2_channel_correlation.pdf")
+    fig.savefig(out / "I2_channel_correlation.png")
     plt.close(fig)
     print("  Figures saved: I1, I2")
 
@@ -727,7 +727,7 @@ def analysis_J_confidence(
     axes[1].scatter(probs, r2s, s=15, alpha=0.6, color="#27ae60")
     axes[1].set(xlabel="P(predicted class)", ylabel="Surrogate R²",
                 title=f"Confidence vs R²  (ρ={rho_prob:.3f})")
-    fig.savefig(out / "J1_confidence_vs_r2.pdf")
+    fig.savefig(out / "J1_confidence_vs_r2.png")
     plt.close(fig)
     print("  Figure saved: J1")
 
@@ -766,7 +766,7 @@ def analysis_K_rate_vs_scale(results: list, sr_pairs: np.ndarray, out: Path):
     axes[1].axvline(0.5, color="k", lw=0.8, ls="--")
     axes[1].set(xlabel=f"Fraction |imp| in high-scale (Ω>{scale_thresh:.1f} cyc/oct)",
                 ylabel="Count", title="Spectral scale contribution")
-    fig.savefig(out / "K1_rate_vs_scale.pdf")
+    fig.savefig(out / "K1_rate_vs_scale.png")
     plt.close(fig)
 
     # Figure K2: Rate-marginal and scale-marginal importance.
@@ -788,7 +788,7 @@ def analysis_K_rate_vs_scale(results: list, sr_pairs: np.ndarray, out: Path):
     axes[1].set_title("Importance vs. spectral scale")
     cb = fig.colorbar(axes[1].collections[0], ax=axes[1])
     cb.set_label("|Rate| (Hz)")
-    fig.savefig(out / "K2_marginal_importance.pdf")
+    fig.savefig(out / "K2_marginal_importance.png")
     plt.close(fig)
 
     print(f"  Mean frac_high_rate:  {frac_high_rate.mean():.3f}")
@@ -828,7 +828,7 @@ def analysis_L_cross_method(
     ax.set(xlabel="Spearman ρ (CorticalLIME vs Occlusion)", ylabel="Count",
            title=f"Cross-method agreement (n={n})")
     ax.legend()
-    fig.savefig(out / "L1_cross_method_agreement.pdf")
+    fig.savefig(out / "L1_cross_method_agreement.png")
     plt.close(fig)
     print("  Figure saved: L1")
 
