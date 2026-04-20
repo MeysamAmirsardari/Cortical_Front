@@ -86,6 +86,168 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Skeptic-proof sanity dashboard (consolidated 2 × 2 PNG)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def sanity_check_dashboard(
+    out_path,
+    *,
+    explainer,
+    occ_explainer,
+    encode_fn,
+    decode_fn,
+    stability_wav,
+    cross_method_wavs,
+    cross_method_imps,
+    cross_method_targets,
+    r2s,
+    probs,
+    n_stability_seeds: int = 10,
+    K_top: int = 20,
+    log=print,
+):
+    """Render a consolidated 2×2 ‘skeptic-proof’ validity dashboard.
+
+    Panel A  Faithfulness curves:   deletion / insertion vs. random.
+    Panel B  Stability heatmap:     n × n Spearman of LIME under seed jitter.
+    Panel C  Fidelity vs. confidence: surrogate R² scatter against P(class).
+    Panel D  Cross-method agreement: LIME (band-collapsed) vs. Occlusion.
+
+    Each panel degrades gracefully if its inputs are unavailable.
+    """
+    from cortical_lime_metrics import (
+        deletion_curve, insertion_curve, explanation_stability,
+    )
+    fig, axes = plt.subplots(2, 2, figsize=(11.6, 9.0))
+    fig.suptitle(
+        "CorticalLIME — Skeptic-Proof Validity Dashboard",
+        fontsize=14, fontweight="bold", y=1.0,
+    )
+
+    # ── Panel A: Faithfulness curves ─────────────────────────────────
+    axA = axes[0, 0]
+    try:
+        n_curves = min(20, len(cross_method_wavs))
+        del_curves_l, ins_curves_l = [], []
+        del_curves_r, ins_curves_r = [], []
+        for i in range(n_curves):
+            wav = cross_method_wavs[i]
+            tc = int(cross_method_targets[i])
+            feats = np.asarray(encode_fn(wav[None, :]))[0]
+            imp_lime = np.asarray(cross_method_imps[i])
+            # Collapse band-mode (n_bands*S,) → (S,) by sum of |.|.
+            S_strfs = explainer.n_strfs
+            if imp_lime.size != S_strfs:
+                imp_lime = np.abs(imp_lime).reshape(-1, S_strfs).sum(axis=0)
+            rng_imp = np.random.default_rng(i).random(S_strfs).astype(np.float32)
+            del_curves_l.append(deletion_curve(feats, imp_lime, decode_fn, tc).scores)
+            ins_curves_l.append(insertion_curve(feats, imp_lime, decode_fn, tc).scores)
+            del_curves_r.append(deletion_curve(feats, rng_imp, decode_fn, tc).scores)
+            ins_curves_r.append(insertion_curve(feats, rng_imp, decode_fn, tc).scores)
+        del_l = np.mean(del_curves_l, axis=0)
+        ins_l = np.mean(ins_curves_l, axis=0)
+        del_r = np.mean(del_curves_r, axis=0)
+        ins_r = np.mean(ins_curves_r, axis=0)
+        x = np.linspace(0, 1, len(del_l))
+        axA.plot(x, del_l, color="#D7263D", lw=2.0, label="Deletion (LIME)")
+        axA.plot(x, ins_l, color="#1B4F8B", lw=2.0, label="Insertion (LIME)")
+        axA.plot(x, del_r, color="#D7263D", lw=1.2, ls="--",
+                 label="Deletion (random)", alpha=0.7)
+        axA.plot(x, ins_r, color="#1B4F8B", lw=1.2, ls="--",
+                 label="Insertion (random)", alpha=0.7)
+        axA.set(xlabel="Fraction of channels modified",
+                ylabel="P(target class)",
+                title="(A) Faithfulness — LIME ≫ Random")
+        axA.legend(loc="center right", fontsize=8)
+    except Exception as e:
+        axA.text(0.5, 0.5, f"Panel A unavailable\n({e})",
+                 ha="center", va="center", transform=axA.transAxes)
+    for s in ("top", "right"):
+        axA.spines[s].set_visible(False)
+
+    # ── Panel B: Stability heatmap ───────────────────────────────────
+    axB = axes[0, 1]
+    try:
+        seeds = list(range(n_stability_seeds))
+        imps = np.zeros((n_stability_seeds, explainer.n_bands * explainer.n_strfs))
+        for i, s in enumerate(seeds):
+            saved_seed = explainer.seed
+            explainer.seed = s
+            try:
+                imps[i] = explainer.explain(stability_wav).importances
+            finally:
+                explainer.seed = saved_seed
+        rho = np.zeros((n_stability_seeds, n_stability_seeds))
+        for i in range(n_stability_seeds):
+            for j in range(n_stability_seeds):
+                rho[i, j] = stats.spearmanr(imps[i], imps[j]).statistic
+        upper = rho[np.triu_indices(n_stability_seeds, 1)]
+        im = axB.imshow(rho, vmin=0.0, vmax=1.0, cmap="viridis",
+                        origin="lower")
+        axB.set(xlabel="Seed", ylabel="Seed",
+                title=f"(B) Stability — mean ρ = {upper.mean():.3f}")
+        cb = fig.colorbar(im, ax=axB, shrink=0.85)
+        cb.set_label("Spearman ρ")
+        cb.outline.set_visible(False)
+    except Exception as e:
+        axB.text(0.5, 0.5, f"Panel B unavailable\n({e})",
+                 ha="center", va="center", transform=axB.transAxes)
+    for s in ("top", "right"):
+        axB.spines[s].set_visible(False)
+
+    # ── Panel C: Fidelity vs confidence ──────────────────────────────
+    axC = axes[1, 0]
+    try:
+        rho_c, p_c = stats.spearmanr(r2s, probs)
+        axC.scatter(probs, r2s, c="#2A9D3F", alpha=0.6, s=22, edgecolors="white")
+        axC.set(xlabel="Model P(target class)", ylabel="Surrogate R²",
+                title=f"(C) Fidelity vs. Confidence — ρ = {rho_c:.3f}")
+        axC.axhline(np.median(r2s), color="grey", lw=0.7, ls=":",
+                    label=f"median R² = {np.median(r2s):.3f}")
+        axC.legend(loc="lower right", fontsize=8)
+    except Exception as e:
+        axC.text(0.5, 0.5, f"Panel C unavailable\n({e})",
+                 ha="center", va="center", transform=axC.transAxes)
+    for s in ("top", "right"):
+        axC.spines[s].set_visible(False)
+
+    # ── Panel D: Cross-method agreement ──────────────────────────────
+    axD = axes[1, 1]
+    try:
+        n_pairs = min(20, len(cross_method_wavs))
+        rhos = []
+        for i in range(n_pairs):
+            wav = cross_method_wavs[i]
+            tc = int(cross_method_targets[i])
+            occ = occ_explainer.explain(wav, target_class=tc)["importances"]
+            imp_lime = np.asarray(cross_method_imps[i])
+            S_strfs = explainer.n_strfs
+            if imp_lime.size != S_strfs:
+                imp_lime = np.abs(imp_lime).reshape(-1, S_strfs).sum(axis=0)
+            r, _ = stats.spearmanr(imp_lime, occ)
+            if not np.isnan(r):
+                rhos.append(r)
+        rhos = np.asarray(rhos)
+        axD.hist(rhos, bins=12, color="#6A359C", edgecolor="white", lw=0.6)
+        axD.axvline(rhos.mean(), color="black", lw=1.4,
+                    label=f"mean = {rhos.mean():.3f}")
+        axD.axvline(0.0, color="grey", lw=0.7, ls=":")
+        axD.set(xlabel="Spearman ρ (LIME vs Occlusion)", ylabel="Utterances",
+                title=f"(D) Cross-Method Agreement — n = {len(rhos)}")
+        axD.legend(loc="upper left", fontsize=8)
+    except Exception as e:
+        axD.text(0.5, 0.5, f"Panel D unavailable\n({e})",
+                 ha="center", va="center", transform=axD.transAxes)
+    for s in ("top", "right"):
+        axD.spines[s].set_visible(False)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out_path)
+    plt.close(fig)
+    log(f"  Saved sanity dashboard → {out_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Plotting defaults
 # ═══════════════════════════════════════════════════════════════════════════
 

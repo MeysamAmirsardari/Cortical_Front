@@ -145,12 +145,29 @@ def _despine(ax: plt.Axes) -> None:
 #                         LOADING & AGGREGATION
 # =============================================================================
 
+LINGUISTIC_BAND_NAMES: List[str] = [
+    "Base / Voicing", "F1 (Height)", "F2 (Frontness)",
+    "F3 (Rhoticity)", "High Freq (Friction)",
+]
+
+
 @dataclass
 class LimeResults:
-    """Container for the contents of ``results_raw.npz``."""
-    importances: np.ndarray   # (N, S)
-    target_classes: np.ndarray  # (N,) int, 1-indexed TIMIT-61
-    sr_pairs: np.ndarray      # (S, 2)  columns: [scale (cyc/oct), rate (Hz)]
+    """Container for the contents of ``results_raw.npz``.
+
+    Supports both legacy single-mask mode (S = n_strfs) and the
+    high-resolution 2-D band mode (S_total = n_bands × n_strfs).
+    """
+    importances: np.ndarray       # (N, S_total)
+    target_classes: np.ndarray    # (N,) int, 1-indexed TIMIT-61
+    sr_pairs: np.ndarray          # (n_strfs, 2)  cols: [scale (cyc/oct), rate (Hz)]
+    n_bands: int = 1
+    band_edges_hz: Optional[np.ndarray] = None   # (n_bands, 2)
+    band_names: Optional[List[str]] = None
+
+    @property
+    def n_strfs(self) -> int:
+        return int(self.sr_pairs.shape[0])
 
     @property
     def rates(self) -> np.ndarray:
@@ -160,14 +177,50 @@ class LimeResults:
     def scales(self) -> np.ndarray:
         return self.sr_pairs[:, 0]
 
+    @property
+    def is_band_mode(self) -> bool:
+        return self.n_bands > 1
+
+    def importance_2d(self, i: int) -> np.ndarray:
+        """Reshape one row to (n_bands, n_strfs); raises if not band-mode."""
+        if not self.is_band_mode:
+            raise ValueError("Not in band mode.")
+        return self.importances[i].reshape(self.n_bands, self.n_strfs)
+
+    def collapse_bands(self) -> np.ndarray:
+        """Return (N, n_strfs): sum of |importance| over the band axis.
+
+        For non-band-mode results, returns ``importances`` unchanged.
+        """
+        if not self.is_band_mode:
+            return self.importances
+        N = self.importances.shape[0]
+        out = np.abs(self.importances).reshape(N, self.n_bands, self.n_strfs)
+        return out.sum(axis=1)
+
 
 def load_lime_results(path: str) -> LimeResults:
-    """Load ``results_raw.npz`` produced by ``run.py``."""
+    """Load ``results_raw.npz`` produced by ``run.py``.
+
+    Auto-detects band mode from the saved ``n_bands`` field; falls back
+    to legacy 1-band mode if the field is absent.
+    """
     with np.load(path, allow_pickle=True) as d:
         importances = np.asarray(d["importances"], dtype=np.float64)
         target_classes = np.asarray(d["target_classes"], dtype=np.int64)
         sr_pairs = np.asarray(d["sr_pairs"], dtype=np.float64)
-    return LimeResults(importances, target_classes, sr_pairs)
+        n_bands = int(d["n_bands"]) if "n_bands" in d.files else 1
+        band_edges = (
+            np.asarray(d["band_edges_hz"], dtype=np.float64)
+            if "band_edges_hz" in d.files and n_bands > 1 else None
+        )
+    band_names = (
+        LINGUISTIC_BAND_NAMES[:n_bands] if n_bands > 1 else None
+    )
+    return LimeResults(
+        importances, target_classes, sr_pairs,
+        n_bands=n_bands, band_edges_hz=band_edges, band_names=band_names,
+    )
 
 
 def _phone61_idx_to_39(idx: int) -> str:
@@ -175,19 +228,31 @@ def _phone61_idx_to_39(idx: int) -> str:
     return PHONE_61_TO_39.get(p61, "")
 
 
-def aggregate_per_phoneme(res: LimeResults) -> Dict[str, np.ndarray]:
+def aggregate_per_phoneme(
+    res: LimeResults,
+    keep_band_axis: bool = False,
+) -> Dict[str, np.ndarray]:
     """Mean absolute importance per TIMIT-39 phoneme.
 
-    Returns
-    -------
-    dict mapping phone_39 → (S,) mean |importance| vector.
+    Parameters
+    ----------
+    keep_band_axis : if True and ``res`` is band-mode, the returned arrays
+        keep their (n_bands, n_strfs) shape; otherwise the band axis is
+        summed out so the output is (n_strfs,) — preserving backward
+        compatibility with plots 1-3 written for the legacy mode.
     """
+    band = keep_band_axis and res.is_band_mode
     bucket: Dict[str, List[np.ndarray]] = {}
     for imp, tc in zip(res.importances, res.target_classes):
         p39 = _phone61_idx_to_39(tc)
         if not p39 or p39 == "sil":
             continue
-        bucket.setdefault(p39, []).append(np.abs(imp))
+        a = np.abs(imp)
+        if res.is_band_mode:
+            a = a.reshape(res.n_bands, res.n_strfs)
+            if not band:
+                a = a.sum(axis=0)
+        bucket.setdefault(p39, []).append(a)
     return {p: np.mean(np.stack(v, 0), 0) for p, v in bucket.items()}
 
 
@@ -198,12 +263,10 @@ def _unique_axis_values(values: np.ndarray) -> np.ndarray:
 def marginalise_by_rate(res: LimeResults) -> Tuple[np.ndarray, np.ndarray]:
     """Per-utterance marginal |importance| over unique temporal-rate bins.
 
-    Returns
-    -------
-    rates_unique : (R,) sorted unique rate values
-    samples      : (N, R)  mean |importance| per utterance per rate bin
+    In band mode, the band axis is summed out before marginalisation so
+    the curve aggregates over all 5 frequency bands.
     """
-    abs_imp = np.abs(res.importances)
+    abs_imp = res.collapse_bands() if res.is_band_mode else np.abs(res.importances)
     rates = res.rates
     rates_unique = _unique_axis_values(rates)
     out = np.zeros((abs_imp.shape[0], rates_unique.size), dtype=np.float64)
@@ -632,6 +695,103 @@ def load_trajectories(path: str) -> List[Dict]:
 
 
 # =============================================================================
+#         PLOT 5 — HIGH-RES BAND × STRF SALIENCY (per phoneme)
+# =============================================================================
+
+def _strf_sort_order(sr_pairs: np.ndarray) -> np.ndarray:
+    """Sort STRF channels by (rate, scale) — produces visually grouped columns."""
+    rate = sr_pairs[:, 1]
+    scale = sr_pairs[:, 0]
+    return np.lexsort((scale, rate))
+
+
+def plot_phoneme_band_strf_matrix(
+    res: LimeResults,
+    phones: Sequence[str] = ("s", "t", "aa", "iy", "f", "m"),
+    band_names: Optional[Sequence[str]] = None,
+    cols: int = 3,
+) -> plt.Figure:
+    """Plot 5 – High-resolution 2-D saliency map (band × STRF) per phoneme.
+
+    For each requested TIMIT-39 phoneme, renders a heatmap of mean
+    |CorticalLIME importance| with rows = 5 frequency bands and columns
+    = STRF channels, sorted by (rate, scale). The ordering makes vertical
+    striping in particular bands the legible signature: e.g. /s/ should
+    show a hot stripe at the top row (High-Frequency Friction) along the
+    high-rate columns; /aa/ should show a hot stripe at the F1/F2 rows
+    along the low-rate columns.
+    """
+    if not res.is_band_mode:
+        raise ValueError("plot_phoneme_band_strf_matrix requires band-mode results.")
+
+    band_names = list(band_names or res.band_names or LINGUISTIC_BAND_NAMES[: res.n_bands])
+    phone_means = aggregate_per_phoneme(res, keep_band_axis=True)
+
+    available = [p for p in phones if p in phone_means]
+    if not available:
+        raise ValueError(f"None of {list(phones)} present in results; "
+                         f"available phones: {sorted(phone_means)}")
+
+    order = _strf_sort_order(res.sr_pairs)
+    rates_sorted = res.rates[order]
+    scales_sorted = res.scales[order]
+
+    n = len(available)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(
+        rows, cols, figsize=(4.6 * cols, 2.5 * rows + 0.6),
+        squeeze=False,
+    )
+    # Joint normalisation for visual comparability across phonemes.
+    matrices = {p: phone_means[p][:, order] for p in available}
+    vmax = max(M.max() for M in matrices.values()) + 1e-12
+
+    im = None
+    for k, p in enumerate(available):
+        r, c = divmod(k, cols)
+        ax = axes[r][c]
+        M = matrices[p] / vmax
+        im = ax.imshow(M, aspect="auto", origin="upper", cmap=SEQ_CMAP,
+                       vmin=0.0, vmax=1.0)
+        ax.set_yticks(np.arange(res.n_bands))
+        ax.set_yticklabels(band_names, fontsize=8)
+        # Light vertical guides whenever the rate value changes.
+        last_rate = None
+        for j, rt in enumerate(rates_sorted):
+            if last_rate is not None and not np.isclose(rt, last_rate):
+                ax.axvline(j - 0.5, color="white", lw=0.4, alpha=0.45)
+            last_rate = rt
+        ax.set_xticks([])
+        fam = FAMILY_OF.get(p, None)
+        col = FAMILY_COLORS.get(fam, "black")
+        ax.set_title(f"/{p}/", color=col)
+        _despine(ax)
+
+    # Hide unused axes.
+    for k in range(n, rows * cols):
+        r, c = divmod(k, cols)
+        axes[r][c].axis("off")
+
+    # Annotate the rate axis on the bottom row only.
+    for c in range(cols):
+        last_used_row = (n - 1) // cols
+        if c <= (n - 1) - last_used_row * cols:
+            ax = axes[last_used_row][c]
+            ax.set_xlabel(r"STRF channels  (sorted by $\omega$, then $\Omega$)")
+
+    fig.suptitle(
+        "High-Resolution 2-D Cortical Saliency Map\n"
+        "(Frequency Band × STRF Channel) per Phoneme",
+        fontsize=14, fontweight="bold", y=1.02,
+    )
+    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.85,
+                        pad=0.02, aspect=30)
+    cbar.set_label(r"Normalised $|$importance$|$")
+    cbar.outline.set_visible(False)
+    return fig
+
+
+# =============================================================================
 #                             TOP-LEVEL RENDERING
 # =============================================================================
 
@@ -667,6 +827,14 @@ def render_all(
     fig3 = plot_phonetic_dendrogram(res, phone_means)
     p3 = os.path.join(outdir, "fig3_phonetic_taxonomy.png")
     fig3.savefig(p3); plt.close(fig3); written["fig3"] = p3
+
+    if res.is_band_mode:
+        try:
+            fig5 = plot_phoneme_band_strf_matrix(res)
+            p5 = os.path.join(outdir, "fig5_band_strf_saliency.png")
+            fig5.savefig(p5); plt.close(fig5); written["fig5"] = p5
+        except Exception as e:
+            print(f"[lingo] fig5 skipped: {e}")
 
     if trajectories_path is not None and os.path.exists(trajectories_path):
         trajs = load_trajectories(trajectories_path)
