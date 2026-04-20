@@ -16,7 +16,7 @@ Usage
 
 Output
 ------
-    analysis_outputs/
+    analysis_outputs2/
     ├── A1_phone_distribution.pdf
     ├── A2_duration_hist.pdf
     ├── ...
@@ -107,7 +107,7 @@ class AnalysisConfig:
     bootstrap_alpha: float = 0.05
 
     # -- Output --
-    output_dir: str = "analysis_outputs"
+    output_dir: str = "analysis_outputs2"
     seed: int = 42
     skip_sections: list = None               # e.g. ["C", "L"]
 
@@ -248,6 +248,10 @@ def _collect_word_trajectories(
         # correct — ~10 calls total, which is a tiny overhead).
         res = explainer.explain(y_crop)
         imp = np.abs(np.asarray(res.importances, dtype=np.float64))
+        # Band-mode: collapse (n_bands*S,) → (S,) by sum over bands.
+        S_strfs_ = sr_pairs.shape[0]
+        if imp.size != S_strfs_ and imp.size % S_strfs_ == 0:
+            imp = imp.reshape(-1, S_strfs_).sum(axis=0)
 
         feats = np.asarray(encode_fn(y_crop[None, :])[0])  # (F, T, S)
         # |feats| summed over the frequency axis → (T, S) per-channel energy.
@@ -472,6 +476,29 @@ def run(cfg: AnalysisConfig):
     log(f"  Strategy: {_strategy}  n_samples={cfg.n_lime_samples}  "
         f"S_total={explainer.n_bands * explainer.n_strfs} "
         f"({explainer.n_bands} bands × {explainer.n_strfs} STRFs)")
+
+    S_strfs = explainer.n_strfs
+
+    def _to_strf(vec):
+        """Collapse a length (n_bands*S) vector onto the S-length STRF
+        axis via sum of |.| over bands. A pass-through for S-length
+        inputs (Occlusion / IG / random baselines). Also handles 2-D
+        arrays of shape (N, n_bands*S) along the last axis."""
+        v = np.asarray(vec)
+        if v.ndim == 1:
+            if v.size == S_strfs:
+                return v
+            if v.size % S_strfs == 0:
+                return np.abs(v).reshape(-1, S_strfs).sum(axis=0)
+            return v
+        if v.ndim == 2:
+            if v.shape[1] == S_strfs:
+                return v
+            if v.shape[1] % S_strfs == 0:
+                n_b = v.shape[1] // S_strfs
+                return np.abs(v).reshape(v.shape[0], n_b, S_strfs).sum(axis=1)
+            return v
+        return v
     occ_explainer = OcclusionSensitivity(encode_fn, decode_fn, sr_pairs)
     ig_explainer = CorticalIntegratedGradients(
         model, nn_params, aud_params, n_steps=cfg.ig_steps,
@@ -500,6 +527,7 @@ def run(cfg: AnalysisConfig):
         # B1: Three methods side-by-side.
         fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
         for ax, (name, imp) in zip(axes, methods0.items()):
+            imp = _to_strf(imp)
             vmax = np.max(np.abs(imp)) + 1e-12
             ax.scatter(sr_pairs[:, 1], sr_pairs[:, 0], c=imp, cmap="RdBu_r",
                        vmin=-vmax, vmax=vmax,
@@ -530,6 +558,13 @@ def run(cfg: AnalysisConfig):
         bm, blo, bhi = bootstrap_importances(
             res0, n_bootstrap=cfg.n_bootstrap, alpha_ci=cfg.bootstrap_alpha, seed=42,
         )
+        # Band-mode: collapse (n_bands*S,) → (S,) via signed mean over bands
+        # (keep signed summary for CIs; we still report sig. count over S).
+        if bm.size != S:
+            n_b = bm.size // S
+            bm = bm.reshape(n_b, S).mean(axis=0)
+            blo = blo.reshape(n_b, S).mean(axis=0)
+            bhi = bhi.reshape(n_b, S).mean(axis=0)
         order = np.argsort(-np.abs(bm))
         fig, ax = plt.subplots(figsize=(8, 3.8))
         x = np.arange(S)
@@ -546,9 +581,10 @@ def run(cfg: AnalysisConfig):
         fig.savefig(out / "B3_bootstrap_ci.png"); plt.close(fig)
 
         # Cross-method agreement.
+        _lime0 = _to_strf(res0.importances)
         for (a, ia), (b, ib) in [
-            (("LIME", res0.importances), ("Occ", occ0["importances"])),
-            (("LIME", res0.importances), ("IG", ig0["importances"])),
+            (("LIME", _lime0), ("Occ", _to_strf(occ0["importances"]))),
+            (("LIME", _lime0), ("IG", _to_strf(ig0["importances"]))),
         ]:
             ag = cross_method_agreement(ia, ib)
             log(f"    {a} vs {b}: ρ={ag['spearman_rho']:.3f}  "
@@ -613,7 +649,7 @@ def run(cfg: AnalysisConfig):
             wav = utts[i].segment_audio(1.0)
             feats = encode_fn(wav[None, :])[0]
             tc = all_results[i].target_class
-            imp = all_results[i].importances
+            imp = _to_strf(all_results[i].importances)
 
             dc = deletion_curve(feats, imp, decode_fn, tc)
             ic = insertion_curve(feats, imp, decode_fn, tc)
@@ -675,7 +711,7 @@ def run(cfg: AnalysisConfig):
         )
         log(f"  Seed ρ = {stab['mean_spearman']:.4f}±{stab['std_spearman']:.4f}")
 
-        all_imps_s = stab["all_importances"]
+        all_imps_s = _to_strf(stab["all_importances"])
         fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
         im = axes[0].imshow(all_imps_s, aspect="auto", cmap="RdBu_r",
                             vmin=-np.max(np.abs(all_imps_s)),
@@ -724,11 +760,12 @@ def run(cfg: AnalysisConfig):
         fig, axes = plt.subplots(rows, 3, figsize=(13, 3.5 * rows), sharey=True)
         axes_flat = axes.ravel()
         for ax, (phn, prof) in zip(axes_flat, top_phns[:n_show]):
-            vmax = np.max(np.abs(prof.mean_importances)) + 1e-12
+            mi = _to_strf(prof.mean_importances)
+            vmax = np.max(np.abs(mi)) + 1e-12
             ax.scatter(sr_pairs[:, 1], sr_pairs[:, 0],
-                       c=prof.mean_importances, cmap="RdBu_r",
+                       c=mi, cmap="RdBu_r",
                        vmin=-vmax, vmax=vmax,
-                       s=30 + 250 * (np.abs(prof.mean_importances) / vmax),
+                       s=30 + 250 * (np.abs(mi) / vmax),
                        edgecolors="k", linewidths=0.3)
             ax.axvline(0, color="grey", lw=0.5, ls=":")
             ax.set_title(f"/{phn}/  n={prof.n_utterances}  R²={prof.mean_r2:.2f}",
@@ -764,7 +801,8 @@ def run(cfg: AnalysisConfig):
 
         fig, ax = plt.subplots(figsize=(7, 4.5))
         for fname, members in PHONEME_FAMILIES.items():
-            rows_ = [profiles[p].mean_importances for p in members if p in profiles]
+            rows_ = [_to_strf(profiles[p].mean_importances)
+                     for p in members if p in profiles]
             if len(rows_) < 2:
                 continue
             fm = np.mean(rows_, axis=0)
@@ -790,7 +828,7 @@ def run(cfg: AnalysisConfig):
             if len(key_pairs) == 1:
                 axes = [axes]
             for ax, pair in zip(axes, key_pairs):
-                cd = comps[pair]["effect_sizes"]
+                cd = _to_strf(comps[pair]["effect_sizes"])
                 cdmax = np.max(np.abs(cd)) + 0.1
                 ax.scatter(sr_pairs[:, 1], sr_pairs[:, 0], c=cd, cmap="PiYG",
                            vmin=-cdmax, vmax=cdmax,
@@ -817,7 +855,8 @@ def run(cfg: AnalysisConfig):
             if n_vp == 1:
                 axes = [axes]
             for ax, (v, uv) in zip(axes, pairs_wd):
-                diff = profiles[v].mean_importances - profiles[uv].mean_importances
+                diff = (_to_strf(profiles[v].mean_importances)
+                        - _to_strf(profiles[uv].mean_importances))
                 vmax = np.max(np.abs(diff)) + 1e-12
                 ax.scatter(sr_pairs[:, 1], sr_pairs[:, 0], c=diff, cmap="PiYG",
                            vmin=-vmax, vmax=vmax,
@@ -842,7 +881,8 @@ def run(cfg: AnalysisConfig):
                         "dental": "#e67e22"}
         fig, ax = plt.subplots(figsize=(7, 4))
         for pname, members in PLACE_GROUPS.items():
-            rows_ = [profiles[p].mean_importances for p in members if p in profiles]
+            rows_ = [_to_strf(profiles[p].mean_importances)
+                     for p in members if p in profiles]
             if not rows_:
                 continue
             fm = np.mean(rows_, axis=0)
@@ -861,7 +901,7 @@ def run(cfg: AnalysisConfig):
     # ══════════════════════════════════════════════════════════════════
     if "I" not in cfg.skip_sections:
         log("\n── I. Filter utilisation ──")
-        all_imps_mat = np.stack([r.importances for r in all_results])
+        all_imps_mat = _to_strf(np.stack([r.importances for r in all_results]))
         mean_abs = np.mean(np.abs(all_imps_mat), axis=0)
         std_across = np.std(all_imps_mat, axis=0)
         cv = std_across / (mean_abs + 1e-12)
@@ -925,7 +965,7 @@ def run(cfg: AnalysisConfig):
     # ══════════════════════════════════════════════════════════════════
     if "K" not in cfg.skip_sections:
         log("\n── K. Rate vs Scale ──")
-        all_imps_mat = np.stack([r.importances for r in all_results])
+        all_imps_mat = _to_strf(np.stack([r.importances for r in all_results]))
         rates = sr_pairs[:, 1]; scales = sr_pairs[:, 0]
         rate_thr = np.median(np.abs(rates))
         scale_thr = np.median(scales)
@@ -973,7 +1013,8 @@ def run(cfg: AnalysisConfig):
             wav = utts[i].segment_audio(1.0)
             tc = all_results[i].target_class
             occ_r = occ_explainer.explain(wav, target_class=tc)
-            rho, _ = stats.spearmanr(all_results[i].importances, occ_r["importances"])
+            rho, _ = stats.spearmanr(_to_strf(all_results[i].importances),
+                                     _to_strf(occ_r["importances"]))
             rhos_cm.append(rho)
             if (i + 1) % 10 == 0:
                 log(f"  {i+1}/{n_cm}...")

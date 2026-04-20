@@ -496,7 +496,8 @@ def bootstrap_importances(
     """
     rng = np.random.default_rng(seed)
     n = len(result.masks)
-    coefs = np.empty((n_bootstrap, result.n_strfs), dtype=np.float32)
+    n_feat = result.masks.shape[1]
+    coefs = np.empty((n_bootstrap, n_feat), dtype=np.float32)
 
     for b in range(n_bootstrap):
         idx = rng.integers(0, n, size=n)

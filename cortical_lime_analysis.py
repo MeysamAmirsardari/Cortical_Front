@@ -31,7 +31,7 @@ Usage
     python ../cortical_lime_analysis.py \\
         --n_utterances 200 \\
         --n_lime_samples 2000 \\
-        --output_dir ../analysis_outputs
+        --output_dir ../analysis_outputs2
 
     # Or use defaults (100 utterances, 1500 perturbations):
     python ../cortical_lime_analysis.py
@@ -1014,7 +1014,7 @@ def main():
     parser.add_argument("--n_lime_samples", type=int, default=1500,
                         help="Perturbation samples per CorticalLIME run.")
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--output_dir", type=str, default="analysis_outputs",
+    parser.add_argument("--output_dir", type=str, default="analysis_outputs2",
                         help="Directory for output figures.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip", type=str, nargs="*", default=[],
