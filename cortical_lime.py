@@ -52,15 +52,67 @@ from sklearn.linear_model import BayesianRidge, Lasso, Ridge
 # 1.  PERTURBATION STRATEGIES
 # ═══════════════════════════════════════════════════════════════════════════
 
+#: Linguistically-motivated frequency bands (Hz) for the high-resolution
+#: 2-D interpretable mapping (Frequency Band × STRF channel).
+LINGUISTIC_FREQ_BANDS_HZ: list[tuple[float, float]] = [
+    (0.0, 400.0),       # Base / Voicing
+    (400.0, 1000.0),    # F1 (vowel height)
+    (1000.0, 2500.0),   # F2 (vowel frontness)
+    (2500.0, 3500.0),   # F3 (rhoticity)
+    (3500.0, 8000.0),   # High-frequency (friction)
+]
+LINGUISTIC_BAND_NAMES: list[str] = [
+    "Base / Voicing", "F1 (Height)", "F2 (Frontness)",
+    "F3 (Rhoticity)", "High Freq (Friction)",
+]
+
+
+def default_cochlear_freqs(n_freq: int, f_lo: float = 125.0, f_hi: float = 8000.0
+                           ) -> np.ndarray:
+    """Log-spaced fallback CFs when the model does not expose its own.
+
+    The diffAudNeuro / NSL cochlear filterbank is log-spaced; this
+    matches the bin centres closely enough for band assignment.
+    """
+    return np.exp(np.linspace(np.log(f_lo), np.log(f_hi), n_freq))
+
+
+def assign_freq_bands(
+    cochlear_freqs: np.ndarray,
+    bands_hz: Sequence[tuple[float, float]] = LINGUISTIC_FREQ_BANDS_HZ,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assign each frequency bin to a band (or to a sentinel "outside" slot).
+
+    Returns
+    -------
+    band_idx : (F,) int — index in [0, n_bands]; ``n_bands`` means
+               "outside any band" (kept always-on during perturbation).
+    in_band  : (F,) bool — True iff the bin lies inside a band.
+    """
+    cochlear_freqs = np.asarray(cochlear_freqs, dtype=np.float64)
+    F = cochlear_freqs.shape[0]
+    n_bands = len(bands_hz)
+    band_idx = np.full(F, n_bands, dtype=np.int64)  # default: sentinel
+    for b, (lo, hi) in enumerate(bands_hz):
+        m = (cochlear_freqs >= lo) & (cochlear_freqs < hi)
+        band_idx[m] = b
+    in_band = band_idx < n_bands
+    return band_idx, in_band
+
+
 class PerturbStrategy(str, Enum):
     """Supported perturbation strategies for the interpretable domain.
 
-    BERNOULLI   Binary on/off per channel, i.i.d. Bernoulli(keep_prob).
-                Default keep_prob=0.85 perturbs only ~15% of filters per
-                sample, preserving the acoustic manifold so the surrogate
-                regression retains high R². Masking ~50% of channels
-                destroys the manifold and collapses predictions toward
-                chance, ruining fidelity.
+    BERNOULLI       Binary on/off per channel, i.i.d. Bernoulli(keep_prob).
+                    Default keep_prob=0.85 perturbs only ~15% of filters per
+                    sample, preserving the acoustic manifold so the surrogate
+                    regression retains high R². Masking ~50% of channels
+                    destroys the manifold and collapses predictions toward
+                    chance, ruining fidelity.
+    BAND_BERNOULLI  Two-dimensional Bernoulli mask over (frequency band,
+                    STRF channel). Yields a high-resolution interpretable
+                    map of size N_bands × N_strfs (e.g. 5 × 66 = 330).
+                    Same keep_prob semantics as BERNOULLI.
     GAUSSIAN    Continuous scaling: each channel is multiplied by a sample
                 from N(1, σ²), clipped to [0, ∞).  Richer signal per
                 perturbation at the cost of a non-binary interpretable
@@ -73,6 +125,7 @@ class PerturbStrategy(str, Enum):
     BERNOULLI = "bernoulli"
     GAUSSIAN = "gaussian"
     STRUCTURED = "structured"
+    BAND_BERNOULLI = "band_bernoulli"
 
 
 def _bernoulli_masks(
@@ -129,6 +182,22 @@ def _structured_masks(
     return masks, labels
 
 
+def _band_bernoulli_masks(
+    n_bands: int,
+    n_strfs: int,
+    n_samples: int,
+    keep_prob: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """2-D Bernoulli mask over (band × channel), flattened to length n_bands*n_strfs."""
+    n_total = n_bands * n_strfs
+    masks = (rng.random((n_samples, n_total)) < keep_prob).astype(np.float32)
+    empty = masks.sum(axis=1) == 0
+    if empty.any():
+        masks[empty, rng.integers(0, n_total, size=int(empty.sum()))] = 1.0
+    return masks
+
+
 def generate_perturbation_masks(
     n_strfs: int,
     n_samples: int,
@@ -137,6 +206,7 @@ def generate_perturbation_masks(
     sigma: float = 0.5,
     sr: Optional[np.ndarray] = None,
     n_groups: int = 8,
+    n_bands: int = 1,
     include_reference: bool = True,
     rng: Optional[np.random.Generator] = None,
 ) -> tuple[np.ndarray, Optional[np.ndarray]]:
@@ -162,6 +232,8 @@ def generate_perturbation_masks(
         masks, group_labels = _structured_masks(
             n_strfs, n_samples, keep_prob, sr, n_groups, rng,
         )
+    elif strategy == PerturbStrategy.BAND_BERNOULLI:
+        masks = _band_bernoulli_masks(n_bands, n_strfs, n_samples, keep_prob, rng)
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -323,6 +395,22 @@ class CorticalLIMEResult:
     kernel_width: float = 0.25
     seed: int = 0
 
+    # -- band-mode metadata (optional) ---
+    n_bands: int = 1
+    band_edges_hz: Optional[np.ndarray] = None   # (n_bands, 2)
+    band_names: Optional[list] = None
+    cochlear_freqs: Optional[np.ndarray] = None  # (F,)
+
+    @property
+    def importance_2d(self) -> np.ndarray:
+        """Reshape (n_bands * n_strfs,) to (n_bands, n_strfs).
+
+        Raises if not in band mode.
+        """
+        if self.n_bands <= 1:
+            raise ValueError("This result is not in BAND_BERNOULLI mode.")
+        return self.importances.reshape(self.n_bands, self.n_strfs)
+
     # -- convenience methods ---
 
     def top_k(self, k: int = 5) -> list[dict]:
@@ -477,6 +565,10 @@ class CorticalLIME:
         surrogate_alpha: float = 1.0,
         batch_size: int = 64,
         seed: int = 0,
+        # ---- band-mode parameters ----
+        frequency_bands: Optional[Sequence[tuple[float, float]]] = None,
+        cochlear_freqs: Optional[np.ndarray] = None,
+        n_freq_bins: Optional[int] = None,
     ):
         self.encode_fn = encode_fn
         self.decode_fn = decode_fn
@@ -496,6 +588,40 @@ class CorticalLIME:
         self.surrogate_alpha = surrogate_alpha
         self.batch_size = batch_size
         self.seed = seed
+
+        # ---- band-mode bookkeeping ----
+        self.frequency_bands = (
+            list(frequency_bands)
+            if frequency_bands is not None
+            else list(LINGUISTIC_FREQ_BANDS_HZ)
+        )
+        self.n_bands = (
+            len(self.frequency_bands)
+            if self.strategy == PerturbStrategy.BAND_BERNOULLI
+            else 1
+        )
+        # Probe the encoder to learn F if not supplied.
+        if self.strategy == PerturbStrategy.BAND_BERNOULLI:
+            if n_freq_bins is None:
+                _probe = np.zeros((1, 16_000), dtype=np.float32)
+                _f = np.asarray(self.encode_fn(_probe))
+                # Cortical tensor convention: (B, F, T, S).
+                n_freq_bins = int(_f.shape[1])
+            self.n_freq_bins = n_freq_bins
+            if cochlear_freqs is None:
+                cochlear_freqs = default_cochlear_freqs(n_freq_bins)
+            self.cochlear_freqs = np.asarray(cochlear_freqs, dtype=np.float64)
+            self.band_idx_per_F, self.in_any_band = assign_freq_bands(
+                self.cochlear_freqs, self.frequency_bands,
+            )
+        else:
+            self.n_freq_bins = n_freq_bins
+            self.cochlear_freqs = (
+                np.asarray(cochlear_freqs, dtype=np.float64)
+                if cochlear_freqs is not None else None
+            )
+            self.band_idx_per_F = None
+            self.in_any_band = None
 
     # -- internal helpers ---------------------------------------------------
 
@@ -527,10 +653,31 @@ class CorticalLIME:
         """
         n = masks.shape[0]
         all_probs = []
+        is_band = self.strategy == PerturbStrategy.BAND_BERNOULLI
+        if is_band:
+            F = cortical_ref.shape[0]
+            assert F == self.n_freq_bins, (
+                f"Encoder produced F={F} but explainer was configured "
+                f"with n_freq_bins={self.n_freq_bins}."
+            )
+            # Append a sentinel "always-on" column for out-of-band frequencies.
+            in_band = self.in_any_band[None, :, None]   # (1, F, 1)
+            band_idx = self.band_idx_per_F              # (F,)
         for start in range(0, n, self.batch_size):
             end = min(start + self.batch_size, n)
             mb = masks[start:end]
-            perturbed = cortical_ref[None, :, :, :] * mb[:, None, None, :]
+            if is_band:
+                # mb : (B, n_bands * S) → (B, n_bands, S)
+                B = mb.shape[0]
+                mb3 = mb.reshape(B, self.n_bands, self.n_strfs)
+                # Append sentinel band of all-ones for out-of-band F bins.
+                ones = np.ones((B, 1, self.n_strfs), dtype=mb3.dtype)
+                mb3 = np.concatenate([mb3, ones], axis=1)        # (B, n_bands+1, S)
+                # Gather over F axis: (B, F, S).
+                full = mb3[:, band_idx, :]
+                perturbed = cortical_ref[None, :, :, :] * full[:, :, None, :]
+            else:
+                perturbed = cortical_ref[None, :, :, :] * mb[:, None, None, :]
             logits = np.asarray(self.decode_fn(perturbed))
             all_probs.append(self._logits_to_probs(logits))
         return np.concatenate(all_probs, axis=0)
@@ -570,6 +717,7 @@ class CorticalLIME:
             sigma=self.sigma,
             sr=self.sr,
             n_groups=self.n_groups,
+            n_bands=self.n_bands,
             include_reference=True,
             rng=rng,
         )
@@ -609,6 +757,16 @@ class CorticalLIME:
             strategy=self.strategy.value,
             kernel_width=self.kernel_width,
             seed=self.seed,
+            n_bands=self.n_bands,
+            band_edges_hz=(
+                np.asarray(self.frequency_bands, dtype=np.float64)
+                if self.strategy == PerturbStrategy.BAND_BERNOULLI else None
+            ),
+            band_names=(
+                list(LINGUISTIC_BAND_NAMES[: self.n_bands])
+                if self.strategy == PerturbStrategy.BAND_BERNOULLI else None
+            ),
+            cochlear_freqs=self.cochlear_freqs,
         )
 
     def explain_batch(

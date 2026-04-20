@@ -77,12 +77,16 @@ class AnalysisConfig:
     n_phones: int = 61
 
     # -- CorticalLIME --
-    n_lime_samples: int = 2000               # perturbation masks per utterance
+    n_lime_samples: int = 4000               # perturbation masks per utterance
     keep_prob: float = 0.85                   # Bernoulli keep probability (perturb ~15% of filters / sample)
     kernel_width: float = 0.25               # LIME exponential kernel σ
     surrogate_type: str = "ridge"            # ridge | lasso | bayesian_ridge
     surrogate_alpha: float = 1.0             # regularisation strength
     batch_size: int = 64                     # decode_fn mini-batch
+
+    # -- High-resolution band-mode --
+    band_mode: bool = True                   # 2-D (band × STRF) interpretable map
+    save_masks: bool = True                  # persist perturbation masks (uint8)
 
     # -- Stability --
     stability_seeds: int = 10                # seeds for seed-consistency test
@@ -457,13 +461,17 @@ def run(cfg: AnalysisConfig):
     # ══════════════════════════════════════════════════════════════════
     # Build explainers
     # ══════════════════════════════════════════════════════════════════
+    _strategy = "band_bernoulli" if cfg.band_mode else "bernoulli"
     explainer = CorticalLIME(
         encode_fn=encode_fn, decode_fn=decode_fn, sr=sr_pairs,
-        strategy="bernoulli", n_samples=cfg.n_lime_samples,
+        strategy=_strategy, n_samples=cfg.n_lime_samples,
         keep_prob=cfg.keep_prob, kernel_width=cfg.kernel_width,
         surrogate_type=cfg.surrogate_type, surrogate_alpha=cfg.surrogate_alpha,
         batch_size=cfg.batch_size, seed=cfg.seed,
     )
+    log(f"  Strategy: {_strategy}  n_samples={cfg.n_lime_samples}  "
+        f"S_total={explainer.n_bands * explainer.n_strfs} "
+        f"({explainer.n_bands} bands × {explainer.n_strfs} STRFs)")
     occ_explainer = OcclusionSensitivity(encode_fn, decode_fn, sr_pairs)
     ig_explainer = CorticalIntegratedGradients(
         model, nn_params, aud_params, n_steps=cfg.ig_steps,
@@ -562,6 +570,11 @@ def run(cfg: AnalysisConfig):
             tcs = np.asarray(d["target_classes"])
             tps = np.asarray(d["target_probs"])
             r2s = np.asarray(d["surrogate_r2s"])
+            n_bands_saved = int(d["n_bands"]) if "n_bands" in d.files else 1
+            band_edges_saved = (
+                np.asarray(d["band_edges_hz"]) if "band_edges_hz" in d.files
+                else None
+            )
         all_results = []
         for i in range(len(imps)):
             r = _Stub()
@@ -569,6 +582,8 @@ def run(cfg: AnalysisConfig):
             r.target_class = int(tcs[i])
             r.target_prob = float(tps[i])
             r.surrogate_r2 = float(r2s[i])
+            r.n_bands = n_bands_saved
+            r.band_edges_hz = band_edges_saved
             # downstream sections that need masks/probs are safely skipped
             # via --skip when --skip_lime is used.
             all_results.append(r)
@@ -978,15 +993,34 @@ def run(cfg: AnalysisConfig):
     # ══════════════════════════════════════════════════════════════════
     # Save results
     # ══════════════════════════════════════════════════════════════════
-    np.savez(
-        out / "results_raw.npz",
-        importances=np.stack([r.importances for r in all_results]),
+    save_dict = dict(
+        importances=np.stack([r.importances for r in all_results]).astype(np.float32),
         target_classes=np.array([r.target_class for r in all_results]),
         target_probs=np.array([r.target_prob for r in all_results]),
         surrogate_r2s=np.array([r.surrogate_r2 for r in all_results]),
         sr_pairs=sr_pairs,
         utterance_ids=np.array([u.utterance_id for u in utts]),
+        # band-mode metadata
+        n_bands=np.int32(getattr(all_results[0], "n_bands", 1)),
+        band_edges_hz=(
+            getattr(all_results[0], "band_edges_hz", None)
+            if getattr(all_results[0], "n_bands", 1) > 1
+            else np.zeros((0, 2))
+        ),
     )
+    if cfg.save_masks and hasattr(all_results[0], "masks") \
+            and all_results[0].masks is not None:
+        # uint8 keeps perfect fidelity for Bernoulli (0/1) masks at 4× compression.
+        try:
+            mks = np.stack([r.masks for r in all_results]).astype(np.uint8)
+            tps = np.stack([r.target_probs for r in all_results]).astype(np.float32)
+            save_dict["masks"] = mks
+            save_dict["per_mask_target_probs"] = tps
+            log(f"  Persisting masks: {mks.shape} uint8 "
+                f"({mks.nbytes / 1e6:.1f} MB)")
+        except Exception as e:
+            log(f"  WARNING: could not persist masks: {e}")
+    np.savez(out / "results_raw.npz", **save_dict)
 
     # ══════════════════════════════════════════════════════════════════
     # N.  Per-word cortical trajectories (for lingo_analysis Plot 4)
@@ -1003,6 +1037,31 @@ def run(cfg: AnalysisConfig):
         log(f"  Saved {len(traj_out)} word trajectories → trajectories.npz")
     else:
         log("  No target words located — skipping trajectory save.")
+
+    # ══════════════════════════════════════════════════════════════════
+    # M.  Skeptic-proof sanity dashboard (consolidated 2 × 2 PNG)
+    # ══════════════════════════════════════════════════════════════════
+    log("\n── M. Sanity-check dashboard ──")
+    try:
+        from cortical_lime_analysis import sanity_check_dashboard
+        n_dash = min(20, len(utts))
+        cm_wavs = [utts[i].segment_audio(1.0) for i in range(n_dash)]
+        cm_imps = [all_results[i].importances for i in range(n_dash)]
+        cm_targs = [all_results[i].target_class for i in range(n_dash)]
+        sanity_check_dashboard(
+            out / "M0_sanity_dashboard.png",
+            explainer=explainer, occ_explainer=occ_explainer,
+            encode_fn=encode_fn, decode_fn=decode_fn,
+            stability_wav=utts[0].segment_audio(1.0),
+            cross_method_wavs=cm_wavs,
+            cross_method_imps=cm_imps,
+            cross_method_targets=cm_targs,
+            r2s=np.array([r.surrogate_r2 for r in all_results]),
+            probs=np.array([r.target_prob for r in all_results]),
+            n_stability_seeds=10, log=log,
+        )
+    except Exception as e:
+        log(f"  Sanity dashboard failed: {e}")
 
     # ══════════════════════════════════════════════════════════════════
     # O.  lingo_analysis publication figures
