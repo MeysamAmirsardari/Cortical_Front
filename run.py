@@ -145,7 +145,7 @@ PROFILES = {
     ),
     "standard": AnalysisConfig(
         n_utterances=200,
-        n_lime_samples=1500,
+        n_lime_samples=4000,   # 5 bands × 66 STRFs = 330 features → need ≥4000
     ),
     "full": AnalysisConfig(
         n_utterances=300,
@@ -299,6 +299,144 @@ def _collect_word_trajectories(
         log(f"  {w:10s}  frames={T}  bounds={len(bounds)}  R²={res.surrogate_r2:.3f}")
 
     return trajectories
+
+
+def _build_hero_cochleagrams(
+    ds, target_phones, sr_hz=16_000, win_s=0.30, log=print,
+):
+    """Find one TIMIT example per target phone and build a log-mel-style
+    cochleagram (STFT-based, no librosa dependency)."""
+    import numpy as np
+    from scipy.signal import spectrogram
+
+    phn_set = {p.lower() for p in target_phones}
+    found = {}
+    for utt in ds:
+        for ps in utt.phone_segments:
+            phn = ps.phone.lower() if hasattr(ps, "phone") else ""
+            # TIMIT-61 → -39 fold for matching
+            from lingo_analysis import PHONE_61_TO_39
+            phn39 = PHONE_61_TO_39.get(phn, phn)
+            if phn39 in phn_set and phn39 not in found:
+                found[phn39] = (utt, ps)
+        if len(found) == len(phn_set):
+            break
+
+    if not found:
+        log("  No matching phones found in dataset for hero cochleagrams.")
+        return {}
+
+    payload = {}
+    n_target = int(win_s * sr_hz)
+    for phn, (utt, ps) in found.items():
+        y = utt.audio
+        mid = (ps.start_sample + ps.end_sample) // 2
+        s = max(0, mid - n_target // 2)
+        if s + n_target > len(y):
+            s = max(0, len(y) - n_target)
+        y_crop = y[s:s + n_target]
+        if len(y_crop) < n_target:
+            y_crop = np.pad(y_crop, (0, n_target - len(y_crop)))
+        # 25 ms windows, 10 ms hop, log-magnitude STFT.
+        nperseg = int(0.025 * sr_hz)
+        noverlap = int(0.015 * sr_hz)
+        f, t, S = spectrogram(
+            y_crop.astype(np.float64), fs=sr_hz,
+            nperseg=nperseg, noverlap=noverlap, scaling="spectrum",
+        )
+        S_db = 10.0 * np.log10(S + 1e-10)
+        # Restrict to audible range used by the frontend.
+        sel = (f >= 60) & (f <= 8000)
+        S_db = S_db[sel]; f = f[sel]
+        payload[f"{phn}__cochleagram"] = S_db.astype(np.float32)
+        payload[f"{phn}__freqs_hz"] = f.astype(np.float32)
+        payload[f"{phn}__duration_s"] = np.float32(win_s)
+        log(f"  {phn:>4s}  spec shape={S_db.shape}  utt={utt.utterance_id}")
+    return payload
+
+
+def _build_manifold(
+    ds, target_word, n_windows, win_dur_s,
+    explainer, all_results, utts, log,
+):
+    """Sliding-window LIME on a single utterance containing ``target_word``,
+    plus background = full-utterance LIME importances from ``all_results``."""
+    import numpy as np
+    from lingo_analysis import IDX_TO_PHONE61, PHONE_61_TO_39
+
+    target_word = target_word.lower()
+    chosen = None
+    for utt in ds:
+        for ws in utt.word_segments:
+            if ws.word.lower() == target_word:
+                chosen = (utt, ws)
+                break
+        if chosen is not None:
+            break
+    if chosen is None:
+        log(f"  Word '{target_word}' not found in dataset.")
+        return None
+
+    utt, ws = chosen
+    sr = 16_000
+    n_win = int(win_dur_s * sr)
+    word_start = ws.start_sample
+    word_end = ws.end_sample
+    word_len = word_end - word_start
+    if word_len < n_win:
+        # Pad symmetrically by extending into surrounding context.
+        slack = n_win - word_len
+        s0 = max(0, word_start - slack // 2)
+        e0 = min(len(utt.audio), s0 + n_win + (word_end - word_start))
+    else:
+        s0, e0 = word_start, word_end
+
+    # Build a uniform sliding window grid covering [s0, e0].
+    if (e0 - s0) <= n_win:
+        starts = [s0]
+    else:
+        starts = np.linspace(s0, e0 - n_win, n_windows).astype(int).tolist()
+
+    win_imps = []
+    win_phones = []
+    for st in starts:
+        y = utt.audio[st:st + n_win].astype(np.float32)
+        if len(y) < n_win:
+            y = np.pad(y, (0, n_win - len(y)))
+        rms = float(np.sqrt(np.mean(y ** 2)))
+        if rms > 0:
+            y = y / rms
+        # LIME on the window.
+        res = explainer.explain(y)
+        win_imps.append(np.asarray(res.importances, dtype=np.float64))
+        # Dominant phone label = phone segment overlapping the window centre.
+        c = st + n_win // 2
+        dom_phn = ""
+        for ps in utt.phone_segments:
+            if ps.start_sample <= c < ps.end_sample:
+                dom_phn = PHONE_61_TO_39.get(ps.phone.lower(), ps.phone.lower())
+                break
+        win_phones.append(dom_phn)
+        log(f"    window {st}..{st+n_win}  phn=/{dom_phn}/  R²={res.surrogate_r2:.3f}")
+
+    background_imps = np.stack(
+        [np.asarray(r.importances, dtype=np.float32) for r in all_results]
+    )
+    bg_phones = []
+    for r in all_results:
+        p61 = IDX_TO_PHONE61.get(int(r.target_class), "")
+        bg_phones.append(PHONE_61_TO_39.get(p61, p61))
+
+    return {
+        "background_imps": background_imps,
+        "background_phones": np.array(bg_phones),
+        "window_imps": np.stack(win_imps).astype(np.float32),
+        "window_phones": np.array(win_phones),
+        "word": np.array(target_word),
+        "word_start": np.int64(word_start),
+        "word_end": np.int64(word_end),
+        "utterance_id": np.array(utt.utterance_id),
+    }
 
 
 def ensure_cochlear_npz():
@@ -1100,9 +1238,45 @@ def run(cfg: AnalysisConfig):
             r2s=np.array([r.surrogate_r2 for r in all_results]),
             probs=np.array([r.target_prob for r in all_results]),
             n_stability_seeds=10, log=log,
+            npz_out=out / "sanity_arrays.npz",
         )
     except Exception as e:
         log(f"  Sanity dashboard failed: {e}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # P.  Hero cochleagrams (Figure 1 input)
+    # ══════════════════════════════════════════════════════════════════
+    log("\n── P. Hero cochleagrams ──")
+    try:
+        hero_phones = ("s", "aa", "iy", "t")
+        hero_payload = _build_hero_cochleagrams(
+            ds, hero_phones, sr_hz=16_000, log=log,
+        )
+        if hero_payload:
+            np.savez(out / "hero_cochleagrams.npz", **hero_payload)
+            log(f"  Saved hero cochleagrams for "
+                f"{sorted({k.split('__', 1)[0] for k in hero_payload})}")
+    except Exception as e:
+        log(f"  Hero cochleagrams failed: {e}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # Q.  Phonetic manifold (Figure 5 input — sliding-window LIME)
+    # ══════════════════════════════════════════════════════════════════
+    log("\n── Q. Phonetic manifold (sliding-window LIME) ──")
+    try:
+        target_word = "water"
+        n_windows = 8
+        win_dur_s = 0.30
+        manifold_payload = _build_manifold(
+            ds, target_word, n_windows, win_dur_s,
+            explainer, all_results, utts, log,
+        )
+        if manifold_payload is not None:
+            np.savez(out / "manifold.npz", **manifold_payload)
+            log(f"  Saved manifold for word '{target_word}' "
+                f"({n_windows} windows + {len(all_results)} background)")
+    except Exception as e:
+        log(f"  Manifold build failed: {e}")
 
     # ══════════════════════════════════════════════════════════════════
     # O.  lingo_analysis publication figures
@@ -1111,10 +1285,15 @@ def run(cfg: AnalysisConfig):
     try:
         from lingo_analysis import render_all as _render_lingo
         lingo_out = out / "figures_lingo"
+        coch_p = out / "hero_cochleagrams.npz"
+        sanity_p = out / "sanity_arrays.npz"
+        mani_p = out / "manifold.npz"
         written = _render_lingo(
-            str(out / "results_raw.npz"),
-            str(out / "trajectories.npz") if traj_out else None,
-            str(lingo_out),
+            results_path=str(out / "results_raw.npz"),
+            cochleagrams_path=str(coch_p) if coch_p.exists() else None,
+            sanity_path=str(sanity_p) if sanity_p.exists() else None,
+            manifold_path=str(mani_p) if mani_p.exists() else None,
+            outdir=str(lingo_out),
         )
         for k, v in written.items():
             log(f"  {k}: {v}")

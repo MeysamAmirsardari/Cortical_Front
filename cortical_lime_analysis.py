@@ -86,6 +86,35 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Band-mode → STRF-axis collapse helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _collapse_to_strf(vec: np.ndarray, n_strfs: int) -> np.ndarray:
+    """Collapse a band-mode importance vector onto the STRF axis.
+
+    Band-mode LIME produces a length-(n_bands * n_strfs) coefficient
+    vector. Legacy scatter plots in this module index by (scale, rate)
+    tuples of length n_strfs. We collapse by summing the absolute
+    coefficients over the band axis — faithful to the semantics of
+    "per-STRF importance, aggregating over frequency-band gating".
+    """
+    v = np.asarray(vec)
+    if v.ndim == 1:
+        if v.size == n_strfs:
+            return v
+        if v.size % n_strfs == 0:
+            return np.abs(v).reshape(-1, n_strfs).sum(axis=0)
+        return v
+    if v.ndim == 2:
+        if v.shape[1] == n_strfs:
+            return v
+        if v.shape[1] % n_strfs == 0:
+            n_b = v.shape[1] // n_strfs
+            return np.abs(v).reshape(v.shape[0], n_b, n_strfs).sum(axis=1)
+    return v
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Skeptic-proof sanity dashboard (consolidated 2 × 2 PNG)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -104,6 +133,7 @@ def sanity_check_dashboard(
     probs,
     n_stability_seeds: int = 10,
     K_top: int = 20,
+    npz_out=None,
     log=print,
 ):
     """Render a consolidated 2×2 ‘skeptic-proof’ validity dashboard.
@@ -245,6 +275,38 @@ def sanity_check_dashboard(
     fig.savefig(out_path)
     plt.close(fig)
     log(f"  Saved sanity dashboard → {out_path}")
+
+    # Persist the underlying arrays so lingo_analysis can re-render
+    # publication-grade versions without recomputing.
+    if npz_out is not None:
+        try:
+            payload = {}
+            try:
+                steps_x = np.linspace(0, 1, len(np.asarray(del_curves_l)[0]))
+                payload["faith_steps"] = steps_x
+                payload["faith_lime_curves"] = np.asarray(del_curves_l)
+                payload["faith_random_curves"] = np.asarray(del_curves_r)
+                payload["faith_lime_insertion"] = np.asarray(ins_curves_l)
+                payload["faith_random_insertion"] = np.asarray(ins_curves_r)
+            except Exception:
+                pass
+            try:
+                payload["stability_matrix"] = np.asarray(rho)
+            except Exception:
+                pass
+            try:
+                payload["fidelity_r2"] = np.asarray(r2s)
+                payload["fidelity_prob"] = np.asarray(probs)
+            except Exception:
+                pass
+            try:
+                payload["crossmethod_rhos"] = np.asarray(rhos)
+            except Exception:
+                pass
+            np.savez(npz_out, **payload)
+            log(f"  Saved sanity arrays → {npz_out}")
+        except Exception as e:
+            log(f"  WARNING: could not persist sanity arrays: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -410,8 +472,10 @@ def analysis_B_single_utterance(
     }
 
     # Figure B1: Three methods side-by-side scatter.
+    n_strfs = sr_pairs.shape[0]
     fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
     for ax, (name, imp) in zip(axes, methods.items()):
+        imp = _collapse_to_strf(imp, n_strfs)
         vmax = np.max(np.abs(imp)) + 1e-12
         sc = ax.scatter(
             sr_pairs[:, 1], sr_pairs[:, 0],
@@ -632,12 +696,14 @@ def analysis_E_phoneme_profiles(
     rows = (n_show + 2) // 3
     fig, axes = plt.subplots(rows, 3, figsize=(13, 3.5 * rows), sharey=True)
     axes = axes.ravel() if n_show > 3 else [axes] if n_show == 1 else axes
+    n_strfs = sr_pairs.shape[0]
     for ax, (phn, prof) in zip(axes, top_phns[:n_show]):
-        vmax = np.max(np.abs(prof.mean_importances)) + 1e-12
+        mi = _collapse_to_strf(prof.mean_importances, n_strfs)
+        vmax = np.max(np.abs(mi)) + 1e-12
         ax.scatter(
             sr_pairs[:, 1], sr_pairs[:, 0],
-            c=prof.mean_importances, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
-            s=30 + 250 * (np.abs(prof.mean_importances) / vmax),
+            c=mi, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+            s=30 + 250 * (np.abs(mi) / vmax),
             edgecolors="k", linewidths=0.3,
         )
         ax.axvline(0, color="grey", lw=0.5, ls=":")
@@ -682,9 +748,11 @@ def analysis_F_manner(profiles: dict, sr_pairs: np.ndarray, out: Path):
         print(f"  {pair}: {res['n_significant']}/{sr_pairs.shape[0]} significant channels")
 
     # Figure F1: Family-averaged importance curves.
+    n_strfs = sr_pairs.shape[0]
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for fname, members in PHONEME_FAMILIES.items():
-        rows = [profiles[p].mean_importances for p in members if p in profiles]
+        rows = [_collapse_to_strf(profiles[p].mean_importances, n_strfs)
+                for p in members if p in profiles]
         if len(rows) < 2:
             continue
         fam_mean = np.mean(rows, axis=0)
@@ -713,7 +781,7 @@ def analysis_F_manner(profiles: dict, sr_pairs: np.ndarray, out: Path):
         if len(available) == 1:
             axes = [axes]
         for ax, pair in zip(axes, available):
-            cd = comparisons[pair]["effect_sizes"]
+            cd = _collapse_to_strf(comparisons[pair]["effect_sizes"], n_strfs)
             cdmax = np.max(np.abs(cd)) + 0.1
             ax.scatter(
                 sr_pairs[:, 1], sr_pairs[:, 0],
@@ -753,8 +821,10 @@ def analysis_G_voicing(profiles: dict, sr_pairs: np.ndarray, out: Path):
     if n == 1:
         axes = [axes]
 
+    n_strfs = sr_pairs.shape[0]
     for ax, (v, uv) in zip(axes, pairs_with_data):
-        diff = profiles[v].mean_importances - profiles[uv].mean_importances
+        diff = (_collapse_to_strf(profiles[v].mean_importances, n_strfs)
+                - _collapse_to_strf(profiles[uv].mean_importances, n_strfs))
         vmax = np.max(np.abs(diff)) + 1e-12
         ax.scatter(
             sr_pairs[:, 1], sr_pairs[:, 0],
@@ -809,7 +879,10 @@ def analysis_H_place(profiles: dict, sr_pairs: np.ndarray, out: Path):
 
 def analysis_I_utilisation(results: list, sr_pairs: np.ndarray, out: Path):
     print("\n=== I. STRF filter utilisation ===")
-    all_imps = np.stack([r.importances for r in results])  # (N, S)
+    n_strfs = sr_pairs.shape[0]
+    all_imps = _collapse_to_strf(
+        np.stack([r.importances for r in results]), n_strfs,
+    )  # (N, n_strfs)
     S = all_imps.shape[1]
 
     # Per-channel statistics across all utterances.
@@ -1011,8 +1084,9 @@ def main():
                         help="Local TIMIT root (skip Kaggle download).")
     parser.add_argument("--n_utterances", type=int, default=100,
                         help="Number of test utterances to analyse.")
-    parser.add_argument("--n_lime_samples", type=int, default=1500,
-                        help="Perturbation samples per CorticalLIME run.")
+    parser.add_argument("--n_lime_samples", type=int, default=4000,
+                        help="Perturbation samples per CorticalLIME run "
+                             "(≥4000 recommended for 5×66=330-feature band mode).")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--output_dir", type=str, default="analysis_outputs2",
                         help="Directory for output figures.")
@@ -1046,7 +1120,7 @@ def main():
     # ── Build explainers ──────────────────────────────────────────────
     explainer = CorticalLIME(
         encode_fn=encode_fn, decode_fn=decode_fn, sr=sr_pairs,
-        strategy="bernoulli", n_samples=args.n_lime_samples, keep_prob=0.85,
+        strategy="band_bernoulli", n_samples=args.n_lime_samples, keep_prob=0.85,
         kernel_width=0.25, surrogate_type="ridge", surrogate_alpha=1.0,
         batch_size=args.batch_size, seed=args.seed,
     )
