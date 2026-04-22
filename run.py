@@ -182,123 +182,10 @@ def check_dependencies():
 # 3.  Cochlear filter cache
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _collect_word_trajectories(
-    ds, encode_fn, explainer, sr_pairs, cfg, log,
-):
-    """Locate target words in TIMIT and build time-resolved cortical
-    trajectories for the lingo_analysis Plot-4 panels.
-
-    For each target word, the first utterance that contains it is chosen.
-    A duration-cfg-sized crop is extracted, centred on the word's midpoint,
-    RMS-normalised, passed through the biomimetic frontend to obtain the
-    cortical-feature tensor, and explained with CorticalLIME. The per-frame
-    saliency is then ``|LIME importance| × per-frame cortical energy``,
-    aggregated into three linguistically-motivated filter groups.
-    """
-    import numpy as np
-    from lingo_analysis import categorise_filters, FILTER_GROUPS
-
-    SR = 16_000
-    FRAME_SAMPLES = 80  # 5 ms at 16 kHz — matches TIMIT labels
-
-    target_set = [w.lower() for w in cfg.trajectory_words]
-    found = {}
-    for utt in ds:
-        for ws in utt.word_segments:
-            w = ws.word.lower()
-            if w in target_set and w not in found:
-                found[w] = (utt, ws)
-        if len(found) == len(target_set):
-            break
-
-    missing = [w for w in target_set if w not in found]
-    if missing:
-        log(f"  Missing target words (not found in split): {missing}")
-    if not found:
-        return []
-
-    groups = categorise_filters(sr_pairs)
-    filter_labels = [fl for fl, _ in FILTER_GROUPS]
-    group_keys = [gk for _, gk in FILTER_GROUPS]
-
-    n_target = int(cfg.trajectory_duration * SR)
-    n_target_frames = n_target // FRAME_SAMPLES
-
-    trajectories = []
-    ordered = [w for w in target_set if w in found]
-    for w in ordered:
-        utt, ws = found[w]
-        y = utt.audio
-        # Centre the crop on the midpoint of the word.
-        mid = (ws.start_sample + ws.end_sample) // 2
-        s = mid - n_target // 2
-        if s < 0:
-            s = 0
-        if s + n_target > len(y):
-            s = max(0, len(y) - n_target)
-        y_crop = y[s:s + n_target]
-        if len(y_crop) < n_target:
-            y_crop = np.pad(y_crop, (0, n_target - len(y_crop)))
-        rms = float(np.sqrt(np.mean(y_crop ** 2)))
-        if rms > 0:
-            y_crop = y_crop / rms
-        y_crop = y_crop.astype(np.float32)
-
-        # Word-specific LIME importance (reused per word; expensive but
-        # correct — ~10 calls total, which is a tiny overhead).
-        res = explainer.explain(y_crop)
-        imp = np.abs(np.asarray(res.importances, dtype=np.float64))
-        # Band-mode: collapse (n_bands*S,) → (S,) by sum over bands.
-        S_strfs_ = sr_pairs.shape[0]
-        if imp.size != S_strfs_ and imp.size % S_strfs_ == 0:
-            imp = imp.reshape(-1, S_strfs_).sum(axis=0)
-
-        feats = np.asarray(encode_fn(y_crop[None, :])[0])  # (F, T, S)
-        # |feats| summed over the frequency axis → (T, S) per-channel energy.
-        energy = np.abs(feats).sum(axis=0)  # shape (T, S)
-        T = energy.shape[0]
-        saliency = imp[None, :] * energy   # (T, S)
-
-        traj = np.zeros((len(group_keys), T), dtype=np.float64)
-        for gi, gk in enumerate(group_keys):
-            idx = groups.get(gk, np.array([], dtype=int))
-            if idx.size:
-                traj[gi] = saliency[:, idx].sum(axis=1)
-
-        # Normalise whole panel so rows are comparable.
-        m = traj.max()
-        if m > 0:
-            traj = traj / m
-
-        # Phoneme boundaries *inside the crop*: find all phone segments
-        # whose [start, end] intersects the crop window, convert to local
-        # frame indices.
-        crop_start = s
-        crop_end = s + n_target
-        bounds: list = []
-        for ps in utt.phone_segments:
-            if ps.end_sample <= crop_start or ps.start_sample >= crop_end:
-                continue
-            local_start = max(ps.start_sample, crop_start) - crop_start
-            frame = int(local_start // FRAME_SAMPLES)
-            phn = ps.phone_39 if getattr(ps, "phone_39", "") else ps.phone
-            if phn and phn != "sil":
-                bounds.append((frame, f"/{phn}/"))
-        # De-duplicate consecutive identical phones and sort by frame.
-        bounds.sort(key=lambda x: x[0])
-        dedup: list = []
-        for b in bounds:
-            if not dedup or dedup[-1][1] != b[1]:
-                dedup.append(b)
-        bounds = dedup
-
-        trajectories.append(
-            {"word": w, "trajectory": traj, "boundaries": bounds,
-             "r2": float(res.surrogate_r2)}
-        )
-        log(f"  {w:10s}  frames={T}  bounds={len(bounds)}  R²={res.surrogate_r2:.3f}")
-
-    return trajectories
+# Removed: _collect_word_trajectories — replaced by Figure 5 (UMAP/t-SNE
+# manifold of sliding-window LIME), which is the principled way to
+# visualise temporal phonetic dynamics for a model whose LIME explanation
+# pools across the entire window.
 
 
 def _build_hero_cochleagrams(
@@ -1202,20 +1089,8 @@ def run(cfg: AnalysisConfig):
     np.savez(out / "results_raw.npz", **save_dict)
 
     # ══════════════════════════════════════════════════════════════════
-    # N.  Per-word cortical trajectories (for lingo_analysis Plot 4)
+    # N.  (removed — replaced by UMAP/t-SNE manifold in Figure 5)
     # ══════════════════════════════════════════════════════════════════
-    log("\n── N. Per-word cortical trajectories ──")
-    traj_out = _collect_word_trajectories(
-        ds, encode_fn, explainer, sr_pairs, cfg, log,
-    )
-    if traj_out:
-        np.savez(
-            out / "trajectories.npz",
-            trajectories=np.array(traj_out, dtype=object),
-        )
-        log(f"  Saved {len(traj_out)} word trajectories → trajectories.npz")
-    else:
-        log("  No target words located — skipping trajectory save.")
 
     # ══════════════════════════════════════════════════════════════════
     # M.  Skeptic-proof sanity dashboard (consolidated 2 × 2 PNG)
