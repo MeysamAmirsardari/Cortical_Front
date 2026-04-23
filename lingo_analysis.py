@@ -298,12 +298,14 @@ def plot_acoustic_vs_cortical_hero(
     Parameters
     ----------
     cochleagrams : ``{phone: {"cochleagram": (F, T), "freqs_hz": (F,),
-                                "duration_s": float}}`` written by run.py.
+                                "duration_s": float, ...}}``  written by
+        ``generate_hero_cochleagrams.py``. May optionally include a
+        ``"lime_importance"`` (n_bands, n_strfs) field — if present, the
+        heatmap is drawn from this *crop-matched* vector rather than from
+        the population-mean ``aggregate_per_phoneme`` fallback. May also
+        include ``"target_prob"``, ``"surrogate_r2"``, ``"phone_dur_s"``
+        and ``"pad_ms"`` for per-panel header annotation.
     phones : ordered list of phones to render (one column each).
-
-    The figure visually demonstrates that /s/ saliency localises in the
-    High-Freq band, while /aa/ localises in F1 / F2 — directly comparing
-    acoustic energy with model-internal weight distribution.
     """
     if not res.is_band_mode:
         raise ValueError("Hero figure requires band-mode results.")
@@ -319,65 +321,114 @@ def plot_acoustic_vs_cortical_hero(
     )
 
     phone_means = aggregate_per_phoneme(res, keep_band_axis=True)
-    available = [p for p in phones if p in phone_means and p in cochleagrams]
+    available = [
+        p for p in phones
+        if p in cochleagrams and (
+            "lime_importance" in cochleagrams[p] or p in phone_means
+        )
+    ]
     if not available:
-        raise ValueError(f"None of {list(phones)} have both LIME and "
-                         f"cochleagram data. LIME: {sorted(phone_means)}, "
-                         f"Cochleagrams: {sorted(cochleagrams)}")
+        raise ValueError(
+            f"None of {list(phones)} have both LIME and cochleagram data. "
+            f"LIME: {sorted(phone_means)}, "
+            f"Cochleagrams: {sorted(cochleagrams)}"
+        )
 
     n = len(available)
     fig, axes = plt.subplots(
-        2, n, figsize=(4.0 * n, 6.4),
-        gridspec_kw={"hspace": 0.32, "wspace": 0.22, "height_ratios": [1.0, 1.05]},
+        2, n,
+        figsize=(4.4 * n, 7.6),
+        gridspec_kw={
+            "hspace": 0.46, "wspace": 0.18,
+            "height_ratios": [1.0, 0.95],
+        },
         squeeze=False,
     )
 
     order = _strf_sort_order(res.sr_pairs)
     rates_sorted = res.rates[order]
 
-    # joint normalisation across LIME panels
-    L_mats = {p: phone_means[p][:, order] for p in available}
+    # ── Build per-panel LIME matrices (prefer crop-matched). ──
+    L_mats: Dict[str, np.ndarray] = {}
+    for p in available:
+        coc = cochleagrams[p]
+        if "lime_importance" in coc:
+            imp = np.abs(np.asarray(coc["lime_importance"], dtype=np.float64))
+            if imp.ndim == 1:
+                imp = imp.reshape(res.n_bands, res.n_strfs)
+        else:
+            imp = phone_means[p]
+        L_mats[p] = imp[:, order]
     vmax_l = max(M.max() for M in L_mats.values()) + 1e-12
 
     im_cochlea = None
     im_lime = None
     for c, p in enumerate(available):
-        # ── TOP: Auditory cochleagram with band guides ──
-        ax_top = axes[0][c]
         coc = cochleagrams[p]
         S_db = np.asarray(coc["cochleagram"], dtype=np.float64)
         freqs = np.asarray(coc["freqs_hz"], dtype=np.float64)
         dur = float(coc.get("duration_s", S_db.shape[1] / 100.0))
+        phone_dur = coc.get("phone_dur_s", None)
+        pad_ms = coc.get("pad_ms", None)
+        prob = coc.get("target_prob", None)
+        r2 = coc.get("surrogate_r2", None)
 
+        fam = FAMILY_OF.get(p, None)
+        col = FAMILY_COLORS.get(fam, "black")
+
+        # ── TOP: Auditory cochleagram with band guides ──
+        ax_top = axes[0][c]
         im_cochlea = ax_top.imshow(
             S_db, origin="lower", aspect="auto", cmap="magma",
-            extent=[0.0, dur, float(freqs.min()), float(freqs.max())],
+            extent=[0.0, dur * 1000.0,
+                    float(freqs.min()), float(freqs.max())],
         )
         ax_top.set_yscale("log")
-        ax_top.set_yticks([125, 500, 1000, 2500, 4000, 8000])
+        ax_top.set_yticks([125, 250, 500, 1000, 2000, 4000, 8000])
         ax_top.get_yaxis().set_major_formatter(
             mpl.ticker.FuncFormatter(lambda x, _: f"{int(x)}")
         )
-        for (lo, hi), name in zip(band_edges, band_names):
-            if lo > 0:
-                ax_top.axhline(lo, color="white", lw=0.9, ls="--", alpha=0.65)
-            ax_top.axhline(hi, color="white", lw=0.9, ls="--", alpha=0.65)
-            mid_y = max(lo, freqs.min() * 1.02) * (
-                hi / max(lo, freqs.min() * 1.02)
-            ) ** 0.5
-            ax_top.text(
-                dur * 0.985, mid_y, name,
-                ha="right", va="center", color="white", fontsize=7.5,
-                alpha=0.95,
-                bbox=dict(boxstyle="round,pad=0.15", fc="black",
-                          ec="none", alpha=0.45),
-            )
-        ax_top.set_xlabel("Time (s)")
+        ax_top.minorticks_off()
+        # Frequency band guides + (only on the first column) right-edge labels.
+        f_min_show = float(freqs.min())
+        f_max_show = float(freqs.max())
+        for bi, ((lo, hi), name) in enumerate(zip(band_edges, band_names)):
+            if 0.0 < lo <= f_max_show:
+                ax_top.axhline(lo, color="white", lw=0.7, ls="--", alpha=0.55)
+            if 0.0 < hi <= f_max_show:
+                ax_top.axhline(hi, color="white", lw=0.7, ls="--", alpha=0.55)
+            if c == n - 1:
+                lo_eff = max(lo, f_min_show * 1.02)
+                hi_eff = min(hi, f_max_show / 1.02)
+                if hi_eff > lo_eff:
+                    mid_y = np.sqrt(lo_eff * hi_eff)
+                    ax_top.text(
+                        dur * 1000.0 * 1.015, mid_y, name,
+                        ha="left", va="center",
+                        color="#222222", fontsize=7.5,
+                        bbox=dict(boxstyle="round,pad=0.18",
+                                  fc="white", ec="#cccccc", lw=0.5,
+                                  alpha=0.95),
+                    )
+        ax_top.set_xlabel("Time (ms)", labelpad=2)
         if c == 0:
             ax_top.set_ylabel("Frequency (Hz)")
-        fam = FAMILY_OF.get(p, None)
-        col = FAMILY_COLORS.get(fam, "black")
-        ax_top.set_title(f"/{p}/  acoustic cochleagram", color=col, fontsize=11)
+        # Title with phone in family colour, duration in subtitle.
+        sub = []
+        if phone_dur is not None:
+            sub.append(f"{float(phone_dur) * 1000.0:.0f} ms")
+        if pad_ms is not None:
+            sub.append(f"\u00B1{float(pad_ms):.0f} ms pad")
+        subtitle = "   ".join(sub)
+        ax_top.set_title(
+            f"/{p}/", color=col, fontsize=15, fontweight="bold", pad=6,
+        )
+        if subtitle:
+            ax_top.text(
+                0.5, 1.012, subtitle, transform=ax_top.transAxes,
+                ha="center", va="bottom", fontsize=8.5, color="#444444",
+                style="italic",
+            )
         _despine(ax_top)
 
         # ── BOTTOM: 5×n_strfs cortical-saliency heatmap ──
@@ -388,38 +439,59 @@ def plot_acoustic_vs_cortical_hero(
             vmin=0.0, vmax=1.0,
         )
         ax_bot.set_yticks(np.arange(res.n_bands))
-        ax_bot.set_yticklabels(band_names if c == 0 else [""] * res.n_bands,
-                               fontsize=8)
+        ax_bot.set_yticklabels(
+            band_names if c == 0 else [""] * res.n_bands, fontsize=8.5,
+        )
         # Light vertical guides at rate transitions.
         last = None
         for j, rt in enumerate(rates_sorted):
             if last is not None and not np.isclose(rt, last):
-                ax_bot.axvline(j - 0.5, color="white", lw=0.4, alpha=0.4)
+                ax_bot.axvline(j - 0.5, color="white", lw=0.35, alpha=0.35)
             last = rt
         ax_bot.set_xticks([])
-        ax_bot.set_xlabel(r"STRF channels  ($\omega \uparrow$)")
-        ax_bot.set_title(f"/{p}/  cortical saliency", color=col, fontsize=11)
+        ax_bot.set_xlabel(
+            r"STRF channels  (rate $\omega \uparrow$, scale $\Omega$ within)",
+            labelpad=2,
+        )
+        # Per-panel header: P(class) and surrogate R² when available.
+        head_bits = []
+        if prob is not None:
+            head_bits.append(f"P={float(prob):.2f}")
+        if r2 is not None:
+            head_bits.append(f"R\u00B2={float(r2):.2f}")
+        head = "   ".join(head_bits) if head_bits else ""
+        ax_bot.set_title(
+            "cortical saliency" + (f"   ({head})" if head else ""),
+            color="#333333", fontsize=10, pad=4,
+        )
         _despine(ax_bot)
 
-    # Colour bars.
+    # ── Colour bars (compact, on the right) ──
     cbar_top = fig.colorbar(
         im_cochlea, ax=axes[0, :].tolist(),
-        orientation="vertical", shrink=0.85, pad=0.01, aspect=22,
+        orientation="vertical", shrink=0.78, pad=0.025, aspect=18,
     )
-    cbar_top.set_label("Power (dB)")
+    cbar_top.set_label("Power (dB)", fontsize=9)
+    cbar_top.ax.tick_params(labelsize=8)
     cbar_top.outline.set_visible(False)
 
     cbar_bot = fig.colorbar(
         im_lime, ax=axes[1, :].tolist(),
-        orientation="vertical", shrink=0.85, pad=0.01, aspect=22,
+        orientation="vertical", shrink=0.78, pad=0.025, aspect=18,
     )
-    cbar_bot.set_label(r"Normalised $|$importance$|$")
+    cbar_bot.set_label(r"Normalised $|$importance$|$", fontsize=9)
+    cbar_bot.ax.tick_params(labelsize=8)
     cbar_bot.outline.set_visible(False)
 
     fig.suptitle(
-        "Acoustic vs. Cortical Saliency:\n"
-        "Where the model listens, by linguistic frequency band",
-        fontsize=14, fontweight="bold", y=1.005,
+        "Acoustic vs. Cortical Saliency",
+        fontsize=15, fontweight="bold", y=0.995,
+    )
+    fig.text(
+        0.5, 0.955,
+        "Per-phoneme cochleagram (top) and crop-matched CorticalLIME "
+        "weights across linguistic bands × STRF channels (bottom)",
+        ha="center", va="top", fontsize=10, style="italic", color="#444444",
     )
     return fig
 
@@ -994,16 +1066,40 @@ def plot_phonetic_manifold_trajectory(
 # =============================================================================
 
 def load_cochleagrams(path: str) -> Dict[str, Dict]:
+    """Load ``hero_cochleagrams.npz``.
+
+    Required per-phone keys: ``__cochleagram``, ``__freqs_hz``, ``__duration_s``.
+    Optional per-phone keys: ``__lime_importance`` (n_bands, n_strfs),
+    ``__phone_dur_s``, ``__pad_ms``, ``__target_prob``, ``__surrogate_r2``,
+    ``__utterance_id``, ``__phone_label``.
+    """
+    optional = (
+        "lime_importance", "phone_dur_s", "pad_ms",
+        "target_prob", "surrogate_r2", "utterance_id", "phone_label",
+    )
     with np.load(path, allow_pickle=True) as d:
+        files = set(d.files)
         keys = [k for k in d.files if k.endswith("__cochleagram")]
         out: Dict[str, Dict] = {}
         for k in keys:
             phn = k.replace("__cochleagram", "")
-            out[phn] = {
+            entry: Dict = {
                 "cochleagram": np.asarray(d[k]),
                 "freqs_hz": np.asarray(d[f"{phn}__freqs_hz"]),
                 "duration_s": float(d[f"{phn}__duration_s"]),
             }
+            for opt in optional:
+                fk = f"{phn}__{opt}"
+                if fk in files:
+                    val = d[fk]
+                    if opt == "lime_importance":
+                        entry[opt] = np.asarray(val, dtype=np.float64)
+                    elif opt in ("phone_dur_s", "pad_ms",
+                                 "target_prob", "surrogate_r2"):
+                        entry[opt] = float(np.asarray(val).item())
+                    else:
+                        entry[opt] = str(np.asarray(val).item())
+            out[phn] = entry
     return out
 
 
