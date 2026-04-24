@@ -330,7 +330,10 @@ def _load_cochleagrams_with_lime(path: Path) -> Dict[str, Dict]:
 _PROJECT_ROOT = Path("/Users/eminent/Projects/Cortical_Front")
 _DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "r_code" / "analysis_outputs2"
 _DEFAULT_RESULTS = _DEFAULT_OUTPUT_DIR / "results_raw.npz"
-_DEFAULT_MODEL_DIR = _PROJECT_ROOT / "r_code" / "checkpoints"
+_DEFAULT_MODEL_DIR = (
+    _PROJECT_ROOT / "r_code" / "nishit_trained_models"
+                  / "main_jax_phoneme_rec_timit"
+)
 
 
 def main() -> None:
