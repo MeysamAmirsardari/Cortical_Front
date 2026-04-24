@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Surgical hero-figure data extractor.
 
 For each target phoneme (default: /s/, /aa/, /iy/, /t/), this script:
@@ -325,13 +326,20 @@ def _load_cochleagrams_with_lime(path: Path) -> Dict[str, Dict]:
     return out
 
 
+# Project-canonical default paths (mirror run.py output layout).
+_PROJECT_ROOT = Path("/Users/eminent/Projects/Cortical_Front")
+_DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "r_code" / "analysis_outputs2"
+_DEFAULT_RESULTS = _DEFAULT_OUTPUT_DIR / "results_raw.npz"
+_DEFAULT_MODEL_DIR = _PROJECT_ROOT / "r_code" / "checkpoints"
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model_dir", default="r_code/checkpoints",
+    p.add_argument("--model_dir", default=str(_DEFAULT_MODEL_DIR),
                    help="Directory containing chkStep_*.p")
     p.add_argument("--timit_local", default=None,
                    help="Optional local TIMIT root (skip Kaggle download).")
-    p.add_argument("--output_dir", default="analysis_outputs2",
+    p.add_argument("--output_dir", default=str(_DEFAULT_OUTPUT_DIR),
                    help="Where to write hero_cochleagrams.npz / PNG.")
     p.add_argument("--phones", nargs="+",
                    default=["s", "aa", "iy", "t"],
@@ -342,9 +350,9 @@ def main() -> None:
                    help="Perturbation masks per CorticalLIME run.")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--results", default=None,
-                   help="Optional path to results_raw.npz (used to size "
-                        "the LIME heatmap when rendering the PNG).")
+    p.add_argument("--results", default=str(_DEFAULT_RESULTS),
+                   help="Path to results_raw.npz (used to size the LIME "
+                        "heatmap when rendering the PNG).")
     args = p.parse_args()
 
     out = Path(args.output_dir)
@@ -374,10 +382,7 @@ def main() -> None:
     np.savez(npz_path, **payload)
     print(f"\nSaved cochleagrams → {npz_path}")
 
-    results_path = (
-        Path(args.results) if args.results is not None
-        else out / "results_raw.npz"
-    )
+    results_path = Path(args.results)
     png_path = out / "fig1_acoustic_vs_cortical_hero.png"
     try:
         render_png(npz_path, results_path, png_path, phones=args.phones)
