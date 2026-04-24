@@ -188,58 +188,9 @@ def check_dependencies():
 # pools across the entire window.
 
 
-def _build_hero_cochleagrams(
-    ds, target_phones, sr_hz=16_000, win_s=0.30, log=print,
-):
-    """Find one TIMIT example per target phone and build a log-mel-style
-    cochleagram (STFT-based, no librosa dependency)."""
-    import numpy as np
-    from scipy.signal import spectrogram
-
-    phn_set = {p.lower() for p in target_phones}
-    found = {}
-    for utt in ds:
-        for ps in utt.phone_segments:
-            phn = ps.phone.lower() if hasattr(ps, "phone") else ""
-            # TIMIT-61 → -39 fold for matching
-            from lingo_analysis import PHONE_61_TO_39
-            phn39 = PHONE_61_TO_39.get(phn, phn)
-            if phn39 in phn_set and phn39 not in found:
-                found[phn39] = (utt, ps)
-        if len(found) == len(phn_set):
-            break
-
-    if not found:
-        log("  No matching phones found in dataset for hero cochleagrams.")
-        return {}
-
-    payload = {}
-    n_target = int(win_s * sr_hz)
-    for phn, (utt, ps) in found.items():
-        y = utt.audio
-        mid = (ps.start_sample + ps.end_sample) // 2
-        s = max(0, mid - n_target // 2)
-        if s + n_target > len(y):
-            s = max(0, len(y) - n_target)
-        y_crop = y[s:s + n_target]
-        if len(y_crop) < n_target:
-            y_crop = np.pad(y_crop, (0, n_target - len(y_crop)))
-        # 25 ms windows, 10 ms hop, log-magnitude STFT.
-        nperseg = int(0.025 * sr_hz)
-        noverlap = int(0.015 * sr_hz)
-        f, t, S = spectrogram(
-            y_crop.astype(np.float64), fs=sr_hz,
-            nperseg=nperseg, noverlap=noverlap, scaling="spectrum",
-        )
-        S_db = 10.0 * np.log10(S + 1e-10)
-        # Restrict to audible range used by the frontend.
-        sel = (f >= 60) & (f <= 8000)
-        S_db = S_db[sel]; f = f[sel]
-        payload[f"{phn}__cochleagram"] = S_db.astype(np.float32)
-        payload[f"{phn}__freqs_hz"] = f.astype(np.float32)
-        payload[f"{phn}__duration_s"] = np.float32(win_s)
-        log(f"  {phn:>4s}  spec shape={S_db.shape}  utt={utt.utterance_id}")
-    return payload
+# Hero cochleagrams: surgical per-phoneme builder lives in
+# generate_hero_cochleagrams.py (build_payload). It is imported on demand
+# in Section P below.
 
 
 def _build_manifold(
@@ -1119,18 +1070,22 @@ def run(cfg: AnalysisConfig):
         log(f"  Sanity dashboard failed: {e}")
 
     # ══════════════════════════════════════════════════════════════════
-    # P.  Hero cochleagrams (Figure 1 input)
+    # P.  Hero cochleagrams (Figure 1 input) — SURGICAL per-phoneme crop
     # ══════════════════════════════════════════════════════════════════
-    log("\n── P. Hero cochleagrams ──")
+    log("\n── P. Hero cochleagrams (surgical) ──")
     try:
+        from generate_hero_cochleagrams import build_payload as _hero_build
         hero_phones = ("s", "aa", "iy", "t")
-        hero_payload = _build_hero_cochleagrams(
-            ds, hero_phones, sr_hz=16_000, log=log,
+        # Reuse the band-mode explainer constructed earlier so the LIME
+        # importances we attach to each crop have the same sr_pairs and
+        # band layout as everything else in this run.
+        hero_payload = _hero_build(
+            ds, explainer, phones=hero_phones, pad_ms=10.0,
         )
         if hero_payload:
             np.savez(out / "hero_cochleagrams.npz", **hero_payload)
             log(f"  Saved hero cochleagrams for "
-                f"{sorted({k.split('__', 1)[0] for k in hero_payload})}")
+                f"{sorted({k.split('__', 1)[0] for k in hero_payload if '__' in k})}")
     except Exception as e:
         log(f"  Hero cochleagrams failed: {e}")
 
