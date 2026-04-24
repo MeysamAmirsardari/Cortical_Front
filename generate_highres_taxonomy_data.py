@@ -211,6 +211,25 @@ def _phone_label_39(ps) -> str:
     return PHONE_61_TO_39.get(ps.phone, ps.phone)
 
 
+def _pad_or_truncate_centered(y: np.ndarray, n_target: int) -> np.ndarray:
+    """Return ``y`` padded (with zeros) or centre-cropped to exactly
+    ``n_target`` samples.  Used to force a single JAX input shape so the
+    JIT-compiled encode/decode graph only has to compile once for the
+    entire scan — otherwise every unique phone length triggers a fresh
+    10–60 s recompile and the scanner appears to hang."""
+    n = y.shape[0]
+    if n == n_target:
+        return y
+    if n > n_target:
+        start = (n - n_target) // 2
+        return y[start:start + n_target]
+    pad = n_target - n
+    left = pad // 2
+    out = np.zeros(n_target, dtype=y.dtype)
+    out[left:left + n] = y
+    return out
+
+
 def collect_perfect_tokens(
     ds: TIMITDataset,
     target_phones: Sequence[str],
@@ -221,6 +240,8 @@ def collect_perfect_tokens(
     sample_rate: int = 16_000,
     pad_ms: float = 5.0,
     require_correct_pred: bool = True,
+    fixed_length_samples: int = 16_000,
+    progress_every: int = 25,
     verbose: bool = True,
 ) -> Dict[str, List[Dict]]:
     """Walk TIMIT once; for each target phoneme collect up to N tokens
@@ -245,11 +266,20 @@ def collect_perfect_tokens(
     if verbose:
         print(f"\nScanning TIMIT TEST split for {len(targets)} target phones, "
               f"need {tokens_per_phone} perfect tokens each "
-              f"(pad ±{pad_ms:.0f} ms, require_correct_pred={require_correct_pred})…")
+              f"(pad ±{pad_ms:.0f} ms, require_correct_pred={require_correct_pred}, "
+              f"fixed_length={fixed_length_samples} samples for one-shot JIT).")
+        print("  Note: first phone triggers a one-off JAX JIT compile "
+              "(~30–90 s). After that expect ~50 ms per classification.")
 
     for utt_idx, utt in enumerate(ds):
         if phones_full == targets:
             break
+        if verbose and progress_every and utt_idx and utt_idx % progress_every == 0:
+            filled = len(phones_full)
+            total_tokens = sum(len(v) for v in tokens_by_phone.values())
+            print(f"  …utt {utt_idx:>4}/{len(ds)}  "
+                  f"phones_full={filled}/{len(targets)}  "
+                  f"tokens_collected={total_tokens}")
         for ps in utt.phone_segments:
             p39 = _phone_label_39(ps)
             if p39 not in targets or p39 in phones_full:
@@ -259,7 +289,8 @@ def collect_perfect_tokens(
             if not (lo_ms <= dur_ms <= hi_ms):
                 continue
 
-            # Surgical crop with the requested padding.
+            # Surgical crop with the requested padding — this is what
+            # LIME will explain later.
             s = max(0, int(ps.start_sample) - pad_samples)
             e = min(len(utt.audio), int(ps.end_sample) + pad_samples)
             y = np.asarray(utt.audio[s:e], dtype=np.float32)
@@ -274,10 +305,14 @@ def collect_perfect_tokens(
                 continue
 
             # Cheap sanity gate: classify the crop and (optionally) reject
-            # if the model argmax doesn't agree with the truth.  This is
-            # what makes a token "perfect".
+            # if the model argmax doesn't agree with the truth.  We pad
+            # the crop to a single fixed length (default 16 000 samples
+            # = 1 s) so JAX only JIT-compiles encode/decode once for the
+            # entire scan — without this, every phone length triggers a
+            # fresh 10–60 s recompile and the scanner appears to hang.
             try:
-                cortical = np.asarray(encode_fn(y_norm[None, :]))
+                y_fixed = _pad_or_truncate_centered(y_norm, fixed_length_samples)
+                cortical = np.asarray(encode_fn(y_fixed[None, :]))
                 logits = np.asarray(decode_fn(cortical))
                 if logits.ndim == 4:
                     logits = logits.mean(axis=2)
@@ -398,6 +433,7 @@ def run_highres_pipeline(
     batch_size: int,
     seed: int,
     require_correct_pred: bool,
+    fixed_length_samples: int = 16_000,
 ) -> Tuple[np.ndarray, List[str], List[str], np.ndarray, int, int]:
     """End-to-end: collect perfect tokens, run high-res LIME, aggregate.
 
@@ -432,6 +468,7 @@ def run_highres_pipeline(
         encode_fn=encode_fn, decode_fn=decode_fn,
         pad_ms=pad_ms,
         require_correct_pred=require_correct_pred,
+        fixed_length_samples=fixed_length_samples,
     )
 
     # ── 2. Run LIME on every collected token. ───────────────────────
@@ -454,8 +491,14 @@ def run_highres_pipeline(
             # New seed per token so we don't waste 5000 reps on identical
             # mask draws across the N tokens of a phoneme.
             explainer.seed = seed + (1009 * (i - 1)) + hash(p) % 9973
+            # Use the same fixed-length audio for LIME that the scanner
+            # used for the correctness gate — keeps the encode/decode
+            # graph at a single compiled shape across the whole run.
+            audio_for_lime = _pad_or_truncate_centered(
+                tok["audio"], fixed_length_samples,
+            )
             res = explain_with_oom_retry(
-                explainer, tok["audio"], tok["class_idx"],
+                explainer, audio_for_lime, tok["class_idx"],
                 verbose_prefix=f"  [{p} {i:>2}/{len(toks)}]",
             )
             if res is None:
@@ -527,6 +570,14 @@ def main() -> None:
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--fixed_length_samples", type=int, default=16_000,
+        help="Pad/truncate every crop to this length before encode/decode. "
+             "Keeps the JAX JIT graph at a single compiled shape for the "
+             "entire run; otherwise each unique phone length triggers a "
+             "fresh 10–60 s recompile and the scanner appears to hang. "
+             "16000 = 1 s @ 16 kHz.",
+    )
+    p.add_argument(
         "--allow_misclassified", action="store_true",
         help="Accept tokens whose argmax prediction disagrees with truth. "
              "Off by default — disabling the check produces a noisier "
@@ -566,6 +617,7 @@ def main() -> None:
         batch_size=args.batch_size,
         seed=args.seed,
         require_correct_pred=not args.allow_misclassified,
+        fixed_length_samples=args.fixed_length_samples,
     )
 
     print("\n" + "─" * 72)
