@@ -53,6 +53,12 @@ _R_CODE = _r_candidate.resolve()
 sys.path.insert(0, str(_R_CODE))
 sys.path.insert(0, str(_SCRIPT_DIR))
 
+# strfpy_jax (imported transitively via supervisedSTRF) opens
+# `./cochba.txt` with a relative path at *module-load* time, so we must
+# chdir into r_code/ before any project import touches it.
+import os as _os
+_os.chdir(str(_R_CODE))
+
 from cortical_lime import CorticalLIME, build_model, make_jax_callables  # noqa: E402
 from timit_dataset import TIMITDataset  # noqa: E402
 from lingo_analysis import (  # noqa: E402
