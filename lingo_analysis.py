@@ -389,27 +389,13 @@ def plot_acoustic_vs_cortical_hero(
             mpl.ticker.FuncFormatter(lambda x, _: f"{int(x)}")
         )
         ax_top.minorticks_off()
-        # Frequency band guides + (only on the first column) right-edge labels.
-        f_min_show = float(freqs.min())
+        # Frequency band guides (dashed white lines, no labels).
         f_max_show = float(freqs.max())
-        for bi, ((lo, hi), name) in enumerate(zip(band_edges, band_names)):
+        for (lo, hi) in band_edges:
             if 0.0 < lo <= f_max_show:
                 ax_top.axhline(lo, color="white", lw=0.7, ls="--", alpha=0.55)
             if 0.0 < hi <= f_max_show:
                 ax_top.axhline(hi, color="white", lw=0.7, ls="--", alpha=0.55)
-            if c == n - 1:
-                lo_eff = max(lo, f_min_show * 1.02)
-                hi_eff = min(hi, f_max_show / 1.02)
-                if hi_eff > lo_eff:
-                    mid_y = np.sqrt(lo_eff * hi_eff)
-                    ax_top.text(
-                        dur * 1000.0 * 1.015, mid_y, name,
-                        ha="left", va="center",
-                        color="#222222", fontsize=7.5,
-                        bbox=dict(boxstyle="round,pad=0.18",
-                                  fc="white", ec="#cccccc", lw=0.5,
-                                  alpha=0.95),
-                    )
         ax_top.set_xlabel("Time (ms)", labelpad=2)
         if c == 0:
             ax_top.set_ylabel("Frequency (Hz)")
