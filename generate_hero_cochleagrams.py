@@ -359,9 +359,26 @@ def main() -> None:
                    help="Optional local TIMIT root (skip Kaggle download).")
     p.add_argument("--output_dir", default=str(_DEFAULT_OUTPUT_DIR),
                    help="Where to write hero_cochleagrams.npz / PNG.")
-    p.add_argument("--phones", nargs="+",
-                   default=["s", "aa", "iy", "t"],
-                   help="TIMIT-39 phones to extract, in order.")
+    p.add_argument(
+        "--phones", nargs="+",
+        default=[
+            # Fricatives
+            "s", "sh", "f", "z",
+            # Stops
+            "t", "k", "p", "b",
+            # Low / open vowels
+            "aa", "ae", "ah", "uw",
+            # High / close vowels
+            "iy", "ih", "eh", "uh",
+            # Nasals + glide
+            "m", "n", "ng", "er",
+        ],
+        help="TIMIT-39 phones to extract, in order. They are rendered "
+             "in groups of --panels_per_fig per output PNG.",
+    )
+    p.add_argument("--panels_per_fig", type=int, default=4,
+                   help="Phonemes per row in each rendered PNG. "
+                        "len(phones) is split into ceil(N / panels) figures.")
     p.add_argument("--pad_ms", type=float, default=10.0,
                    help="Symmetric padding (ms) added to phone bounds.")
     p.add_argument("--n_lime_samples", type=int, default=4000,
@@ -384,7 +401,7 @@ def main() -> None:
         encode_fn=encode_fn, decode_fn=decode_fn, sr=sr_pairs,
         strategy="band_bernoulli",
         n_samples=args.n_lime_samples, keep_prob=0.85,
-        kernel_width=0.25, surrogate_type="ridge", surrogate_alpha=1.0,
+        kernel_width=0.25, surrogate_type="ridge", surrogate_alpha=0.1,
         batch_size=args.batch_size, seed=args.seed,
     )
 
@@ -400,12 +417,28 @@ def main() -> None:
     np.savez(npz_path, **payload)
     print(f"\nSaved cochleagrams → {npz_path}")
 
+    # Restrict to phones that actually produced a cochleagram (some may have
+    # been skipped if no clean token was found).
+    extracted = [
+        p for p in args.phones
+        if f"{p}__cochleagram" in payload
+    ]
+    if not extracted:
+        print("  No phones extracted — nothing to render.")
+        return
+
     results_path = Path(args.results)
-    png_path = out / "fig1_acoustic_vs_cortical_hero.png"
-    try:
-        render_png(npz_path, results_path, png_path, phones=args.phones)
-    except RuntimeError as e:
-        print(f"\n  PNG render skipped: {e}")
+    panels = max(1, int(args.panels_per_fig))
+    n_figs = (len(extracted) + panels - 1) // panels
+    print(f"\nRendering {n_figs} figure(s)  ({panels} panels each)…")
+    for i in range(n_figs):
+        chunk = extracted[i * panels : (i + 1) * panels]
+        suffix = f"_{i + 1:02d}" if n_figs > 1 else ""
+        png_path = out / f"fig1_acoustic_vs_cortical_hero{suffix}.png"
+        try:
+            render_png(npz_path, results_path, png_path, phones=chunk)
+        except RuntimeError as e:
+            print(f"  PNG render skipped for chunk {chunk}: {e}")
 
 
 if __name__ == "__main__":

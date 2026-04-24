@@ -421,13 +421,19 @@ def plot_acoustic_vs_cortical_hero(
             sub.append(f"\u00B1{float(pad_ms):.0f} ms pad")
         subtitle = "   ".join(sub)
         ax_top.set_title(
-            f"/{p}/", color=col, fontsize=15, fontweight="bold", pad=6,
+            f"/{p}/", color=col, fontsize=16, fontweight="bold", pad=8,
         )
+        # Place duration / pad annotation INSIDE the panel (upper-right
+        # corner with a white pill) so it never collides with the phone-glyph
+        # title or the neighbouring panel's title.
         if subtitle:
             ax_top.text(
-                0.5, 1.012, subtitle, transform=ax_top.transAxes,
-                ha="center", va="bottom", fontsize=8.5, color="#444444",
+                0.985, 0.965, subtitle, transform=ax_top.transAxes,
+                ha="right", va="top", fontsize=8.0, color="#1A1A1A",
                 style="italic",
+                bbox=dict(boxstyle="round,pad=0.22",
+                          fc="white", ec="#cccccc", lw=0.5, alpha=0.92),
+                zorder=5,
             )
         _despine(ax_top)
 
