@@ -40,9 +40,18 @@ import numpy as np
 from scipy.signal import spectrogram
 
 # ────────────────────────────────────────────────────────────────────────
-# Project imports
+# Project imports — mirror run.py's path resolution so r_code modules
+# (supervisedSTRF, etc.) are discoverable wherever this script lives.
 # ────────────────────────────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_r_candidate = _SCRIPT_DIR.parent / "r_code"
+if not _r_candidate.is_dir():
+    _r_candidate = _SCRIPT_DIR / "r_code"
+if not _r_candidate.is_dir():
+    _r_candidate = _SCRIPT_DIR
+_R_CODE = _r_candidate.resolve()
+sys.path.insert(0, str(_R_CODE))
+sys.path.insert(0, str(_SCRIPT_DIR))
 
 from cortical_lime import CorticalLIME, build_model, make_jax_callables  # noqa: E402
 from timit_dataset import TIMITDataset  # noqa: E402
