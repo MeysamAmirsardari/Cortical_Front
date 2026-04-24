@@ -93,26 +93,53 @@ _DEFAULT_RESULTS = _DEFAULT_OUTPUT_DIR / "results_raw.npz"
 # ────────────────────────────────────────────────────────────────────────
 
 def _gabor_envelope_kernel(
+    omega: float,
+    Omega: float,
     t: np.ndarray,
     f_oct: np.ndarray,
-    sigma_t_s: float = 0.10,
-    sigma_f_oct: float = 0.5,
+    omega_floor_hz: float = 2.0,
+    Omega_floor_cpo: float = 0.5,
+    cycles: float = 0.5,
 ) -> np.ndarray:
-    """Phase-invariant 2-D Gabor *envelope* kernel.
+    """Phase-invariant 2-D Gabor *envelope* kernel with **adaptive** width.
 
     The diffAudNeuro cortical wavelets are read out as magnitude / power,
     so the relevant template is the Gaussian envelope alone — without
     the temporal or spectral carrier — centred at (t = 0, f_oct = 0).
 
+    Critical: in a modulation filterbank (and in real cortex) the envelope
+    width must be **inversely proportional** to the channel's modulation
+    rate ω and spectral scale Ω — the constant-Q / wavelet property.
+    Otherwise high-rate channels (e.g. the burst of /t/, ~30 Hz) get
+    smeared across hundreds of ms and the eSTRF degenerates into a
+    blurry cloud.
+
+    Adaptive widths used here::
+
+        |ω̃| = max(|ω|, omega_floor_hz)        # cap to avoid huge envelopes
+        |Ω̃| = max(|Ω|, Omega_floor_cpo)
+        σ_t  = cycles / |ω̃|                    # seconds   (½-cycle by default)
+        σ_f  = cycles / |Ω̃|                    # octaves
+
     Parameters
     ----------
-    t       : (n_t,) seconds, relative to centre.
-    f_oct   : (n_f,) octaves, relative to the band centre frequency.
+    omega           : temporal rate ω in Hz (channel-specific).
+    Omega           : spectral scale Ω in cycles/octave (channel-specific).
+    t               : (n_t,) seconds, relative to centre.
+    f_oct           : (n_f,) octaves, relative to the band centre.
+    omega_floor_hz  : floor on |ω| to avoid pathological widths near DC.
+    Omega_floor_cpo : floor on |Ω| (cycles per octave).
+    cycles          : envelope half-width in carrier cycles. 0.5 ⇒ the
+                      envelope contains roughly one full carrier period.
 
     Returns
     -------
-    K : (n_t, n_f) real, non-negative — the 2-D Gaussian envelope.
+    K : (n_t, n_f) real, non-negative — the adaptive 2-D Gaussian envelope.
     """
+    abs_omega = max(abs(float(omega)), omega_floor_hz)
+    abs_Omega = max(abs(float(Omega)), Omega_floor_cpo)
+    sigma_t_s = cycles / abs_omega
+    sigma_f_oct = cycles / abs_Omega
     env_t = np.exp(-(t / sigma_t_s) ** 2 / 2.0)
     env_f = np.exp(-(f_oct / sigma_f_oct) ** 2 / 2.0)
     return np.outer(env_t, env_f)
@@ -122,21 +149,27 @@ def reconstruct_estrf_envelope(
     coefs: np.ndarray,
     sr_pairs: np.ndarray,
     band_edges_hz: np.ndarray,
-    n_t: int = 192,
-    n_f: int = 128,
+    n_t: int = 256,
+    n_f: int = 160,
     t_window_s: float = 0.30,
     f_range_oct: Tuple[float, float] = (-1.0, 6.0),
-    sigma_t_s: float = 0.10,
-    sigma_f_oct: float = 0.5,
-    smoothing_sigma: float = 1.0,
+    omega_floor_hz: float = 2.0,
+    Omega_floor_cpo: float = 0.5,
+    cycles: float = 0.5,
+    smoothing_sigma: float = 0.8,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Synthesise the modulation-energy eSTRF for one phoneme.
+    """Synthesise the modulation-energy eSTRF for one phoneme with
+    **channel-adaptive** Gabor envelopes.
 
-    Walks every (band b, STRF k) cell of the band-mode LIME coefficient
-    matrix and stamps a Gaussian envelope (no carrier) at the band's
-    geometric-mean frequency, weighted by the *signed* LIME coefficient.
-    A light 2-D Gaussian post-smoothing (default σ=1 px) blends the
-    band-edge seams into a single readable cortical template.
+    For each (band b, STRF channel k) cell of the band-mode LIME
+    coefficient matrix we stamp a 2-D Gaussian envelope at the band's
+    geometric-mean frequency.  The envelope widths (σ_t, σ_f) are
+    derived from this channel's own rate ω and scale Ω, so high-rate /
+    high-scale channels produce narrow, impulsive templates and
+    low-rate / low-scale channels produce broad ones — the correct
+    constant-Q behaviour.  The stamp is weighted by the *signed* LIME
+    coefficient and a light Gaussian post-filter (default σ=0.8 px)
+    blends the band-edge seams.
 
     Returns
     -------
@@ -147,6 +180,9 @@ def reconstruct_estrf_envelope(
     n_bands, n_strfs = band_edges_hz.shape[0], sr_pairs.shape[0]
     coefs_2d = np.asarray(coefs, dtype=np.float64).reshape(n_bands, n_strfs)
     band_centres = _band_freq_centers_oct(band_edges_hz)
+    # Column convention in sr_pairs: [scale Ω, rate ω].
+    scales = np.asarray(sr_pairs[:, 0], dtype=np.float64)
+    rates = np.asarray(sr_pairs[:, 1], dtype=np.float64)
 
     t = np.linspace(-t_window_s / 2.0, t_window_s / 2.0, n_t)
     f_oct = np.linspace(f_range_oct[0], f_range_oct[1], n_f)
@@ -158,10 +194,13 @@ def reconstruct_estrf_envelope(
             if w == 0.0:
                 continue
             kernel = _gabor_envelope_kernel(
+                omega=rates[k],
+                Omega=scales[k],
                 t=t,
                 f_oct=f_oct - band_centres[b],
-                sigma_t_s=sigma_t_s,
-                sigma_f_oct=sigma_f_oct,
+                omega_floor_hz=omega_floor_hz,
+                Omega_floor_cpo=Omega_floor_cpo,
+                cycles=cycles,
             )
             estrf += w * kernel
 
@@ -177,10 +216,11 @@ def reconstruct_estrf_envelope(
 def plot_estrf_envelope(
     res: LimeResults,
     phones: Sequence[str] = ("s", "aa", "iy", "t", "f", "m"),
-    cols: int = 3,
-    smoothing_sigma: float = 1.0,
-    sigma_t_s: float = 0.10,
-    sigma_f_oct: float = 0.5,
+    cols: int = 4,
+    smoothing_sigma: float = 0.8,
+    omega_floor_hz: float = 2.0,
+    Omega_floor_cpo: float = 0.5,
+    cycles: float = 0.5,
 ) -> plt.Figure:
     """Figure — envelope-only eSTRF reconstructions.
 
@@ -212,7 +252,9 @@ def plot_estrf_envelope(
     for p in available:
         estrf, t, f_oct = reconstruct_estrf_envelope(
             signed[p], res.sr_pairs, band_edges,
-            sigma_t_s=sigma_t_s, sigma_f_oct=sigma_f_oct,
+            omega_floor_hz=omega_floor_hz,
+            Omega_floor_cpo=Omega_floor_cpo,
+            cycles=cycles,
             smoothing_sigma=smoothing_sigma,
         )
         panels[p] = (estrf, t, f_oct)
@@ -316,17 +358,30 @@ def main() -> None:
                    help="Path to results_raw.npz (band-mode required).")
     p.add_argument("--output_dir", default=str(_DEFAULT_OUTPUT_DIR),
                    help="Where to write the rendered PNG.")
-    p.add_argument("--phones", nargs="+",
-                   default=["s", "aa", "iy", "t", "f", "m"],
-                   help="TIMIT-39 phones to render (one panel each).")
-    p.add_argument("--cols", type=int, default=3,
+    p.add_argument(
+        "--phones", nargs="+",
+        default=[
+            # Same 20-phoneme set as Figure 1, in identical order so the
+            # eSTRF panels line up phone-for-phone with the cochleagrams.
+            "s", "sh", "f", "z",
+            "t", "k", "p", "b",
+            "aa", "ae", "ah", "uw",
+            "iy", "ih", "eh", "uh",
+            "m", "n", "ng", "er",
+        ],
+        help="TIMIT-39 phones to render (one panel each).",
+    )
+    p.add_argument("--cols", type=int, default=4,
                    help="Number of panel columns in the grid.")
-    p.add_argument("--smoothing_sigma", type=float, default=1.0,
+    p.add_argument("--smoothing_sigma", type=float, default=0.8,
                    help="2-D Gaussian post-smoothing σ (pixels).")
-    p.add_argument("--sigma_t_s", type=float, default=0.10,
-                   help="Temporal envelope σ (seconds).")
-    p.add_argument("--sigma_f_oct", type=float, default=0.5,
-                   help="Spectral envelope σ (octaves).")
+    p.add_argument("--omega_floor_hz", type=float, default=2.0,
+                   help="Floor on |ω| (Hz) when computing σ_t = cycles/|ω|.")
+    p.add_argument("--Omega_floor_cpo", type=float, default=0.5,
+                   help="Floor on |Ω| (cyc/oct) when computing σ_f = cycles/|Ω|.")
+    p.add_argument("--cycles", type=float, default=0.5,
+                   help="Envelope half-width in carrier cycles "
+                        "(0.5 ⇒ ~one full carrier period across ±σ).")
     p.add_argument(
         "--output_name",
         default="fig4_estrf_reconstruction_v3_envelope.png",
@@ -358,8 +413,9 @@ def main() -> None:
         phones=tuple(args.phones),
         cols=args.cols,
         smoothing_sigma=args.smoothing_sigma,
-        sigma_t_s=args.sigma_t_s,
-        sigma_f_oct=args.sigma_f_oct,
+        omega_floor_hz=args.omega_floor_hz,
+        Omega_floor_cpo=args.Omega_floor_cpo,
+        cycles=args.cycles,
     )
     fig.savefig(png_path)
     plt.close(fig)
