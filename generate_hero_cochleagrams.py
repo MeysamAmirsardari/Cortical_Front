@@ -266,26 +266,38 @@ def crop_with_padding(
 def cochleagram_db_for_display(
     coch_lin_TF: np.ndarray,
     db_floor: float = 60.0,
-    eps: float = 1e-6,
 ) -> np.ndarray:
     """Convert the model's *linear-energy* cochleagram into the dB image
     we plot in the figure.
 
+    Conventions
+    -----------
+    Follows the NSL toolbox ``aud2dB`` convention: normalise to the
+    per-panel peak, then take ``20·log10``.  The result is in [-∞, 0]
+    dB; we clip to ``[-db_floor, 0]`` so the colourmap has a sane,
+    panel-agnostic range that surfaces formant structure clearly.
+
     Parameters
     ----------
     coch_lin_TF : (T, F) array, output of ``model.wav2aud``.  May contain
-        small negatives from the LIN convolution + leaky integration
-        (numerical) — we rectify before the log.
-    db_floor : dynamic-range clip in dB (relative to per-panel max).
-    eps : log-floor to keep ``log10(0)`` safe.
+        tiny negatives from the LIN convolution + leaky integration —
+        we rectify before normalising.
+    db_floor : dynamic-range below the per-panel peak that we display
+        (e.g. 60 ⇒ everything below the peak − 60 dB is clipped).
 
     Returns
     -------
-    (T, F) float32 array in dB, with ``coch.max() − db_floor`` floor.
+    (T, F) float32 array in dB, in the closed range ``[-db_floor, 0]``.
     """
     coch_pos = np.clip(coch_lin_TF, 0.0, None).astype(np.float64)
-    coch_db = 20.0 * np.log10(coch_pos + eps)
-    coch_db = np.clip(coch_db, coch_db.max() - db_floor, None)
+    peak = float(coch_pos.max())
+    if peak <= 0.0:
+        # Pathological all-zero panel — return a flat floor rather than -inf.
+        return np.full(coch_pos.shape, -db_floor, dtype=np.float32)
+    # Normalise relative to the panel peak, then convert to dB.  The +1e-12
+    # guard avoids -inf at exact zeros without distorting the dB above floor.
+    coch_db = 20.0 * np.log10(coch_pos / peak + 1e-12)
+    coch_db = np.clip(coch_db, -db_floor, 0.0)
     return coch_db.astype(np.float32)
 
 
@@ -361,10 +373,19 @@ def build_payload(
         )
         crop_dur_s = len(y_crop) / sample_rate
 
+        # RMS-normalise so the model frontend sees the same scale it was
+        # trained on (and the same scale CorticalLIME will use a moment
+        # later).  Without this the cochleagram for a quiet TIMIT clip
+        # collapses to ≈0 → flat panels in the figure.
+        y_norm = y_crop.astype(np.float32)
+        rms = float(np.sqrt(np.mean(y_norm ** 2)))
+        if rms > 0:
+            y_norm = y_norm / rms
+
         # ── 2. Cochleagram from the MODEL's own NSL frontend ──
         # Note: each unique crop length triggers a one-off JAX recompile
         # of wav2aud; for the ~20 hero phones this is a few minutes total.
-        coch_TF_lin = cochlea_fn(y_crop.astype(np.float32))   # (T, F)
+        coch_TF_lin = cochlea_fn(y_norm)                              # (T, F)
         coch_TF_db = cochleagram_db_for_display(
             coch_TF_lin, db_floor=db_floor,
         )
@@ -373,7 +394,10 @@ def build_payload(
         freqs = cochleagram_freq_axis(coch_TF_lin.shape[1]).astype(np.float32)
 
         # ── 3. CorticalLIME on the SAME crop (no audio changes) ──
-        imp_vec, p_class, r2, tc = explain_crop(explainer, y_crop)
+        # explain_crop will RMS-renormalise internally; safe to pass
+        # either y_crop or y_norm — passing y_norm makes provenance
+        # explicit.
+        imp_vec, p_class, r2, tc = explain_crop(explainer, y_norm)
         if n_bands > 1 and imp_vec.size == n_bands * n_strfs:
             imp_2d = imp_vec.reshape(n_bands, n_strfs)
         else:
