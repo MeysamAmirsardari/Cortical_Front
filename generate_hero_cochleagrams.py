@@ -272,16 +272,29 @@ def cochleagram_db_for_display(
 
     Conventions
     -----------
-    Follows the NSL toolbox ``aud2dB`` convention: normalise to the
-    per-panel peak, then take ``20·log10``.  The result is in [-∞, 0]
-    dB; we clip to ``[-db_floor, 0]`` so the colourmap has a sane,
-    panel-agnostic range that surfaces formant structure clearly.
+    The trained checkpoint ships with ``alpha = 1.007621`` (slightly
+    above 1), which inverts the leaky-integrator's sign convention:
+    the model's ``wav2aud`` output is a *signed* envelope whose peak
+    energy lives at the **most-negative** values, with maxima close to
+    zero.  The diagnostic probe (``debug_cochlea.py``) confirmed this
+    directly: full-utterance min ≈ −75 dB-equivalent, max ≈ 0, with
+    ~80 % of bins negative.  Naïvely clipping at ``coch ≥ 0`` (the
+    standard NSL convention for ``alpha < 1``) zeros out the entire
+    spectro-temporal envelope and produces a uniformly black panel
+    — exactly the artefact we hit on the first attempt.
+
+    The fix is to use the **magnitude** of the envelope.  Because the
+    output is non-positive, ``|coch|`` and ``-clip(coch, max=0)`` are
+    numerically identical for this checkpoint, so we use ``np.abs``
+    (more robust to sign drift in future checkpoints).  We then
+    normalise to the per-panel peak and convert to dB, exactly as in
+    the NSL toolbox's ``aud2dB``.  The result is clipped to
+    ``[-db_floor, 0]`` for a sane, panel-agnostic colourbar range.
 
     Parameters
     ----------
-    coch_lin_TF : (T, F) array, output of ``model.wav2aud``.  May contain
-        tiny negatives from the LIN convolution + leaky integration —
-        we rectify before normalising.
+    coch_lin_TF : (T, F) array, output of ``model.wav2aud``.  May be
+        signed.  We work with ``|coch|``.
     db_floor : dynamic-range below the per-panel peak that we display
         (e.g. 60 ⇒ everything below the peak − 60 dB is clipped).
 
@@ -289,14 +302,14 @@ def cochleagram_db_for_display(
     -------
     (T, F) float32 array in dB, in the closed range ``[-db_floor, 0]``.
     """
-    coch_pos = np.clip(coch_lin_TF, 0.0, None).astype(np.float64)
-    peak = float(coch_pos.max())
+    coch_mag = np.abs(np.asarray(coch_lin_TF, dtype=np.float64))
+    peak = float(coch_mag.max())
     if peak <= 0.0:
         # Pathological all-zero panel — return a flat floor rather than -inf.
-        return np.full(coch_pos.shape, -db_floor, dtype=np.float32)
+        return np.full(coch_mag.shape, -db_floor, dtype=np.float32)
     # Normalise relative to the panel peak, then convert to dB.  The +1e-12
     # guard avoids -inf at exact zeros without distorting the dB above floor.
-    coch_db = 20.0 * np.log10(coch_pos / peak + 1e-12)
+    coch_db = 20.0 * np.log10(coch_mag / peak + 1e-12)
     coch_db = np.clip(coch_db, -db_floor, 0.0)
     return coch_db.astype(np.float32)
 
